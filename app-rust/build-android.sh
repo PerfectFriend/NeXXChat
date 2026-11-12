@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Сборка native-библиотеки NeXX (libnexxapp.so) под Android через NDK.
+#
+# Ключевой момент: крейт ring (C-часть) собирается кросс-компилятором через
+# cc-rs. Без переменных CC_*/AR_* cc-rs берёт ХОСТОВЫЙ cc, и сборка падает с
+#   fatal error: 'bits/libc-header-start.h' file not found
+# (хостовые glibc-заголовки вместо sysroot NDK). Ниже выставляем NDK-тулчейн.
+#
+# usage: ./build-android.sh [target ...]   (по умолчанию все три ABI)
+set -euo pipefail
+
+NDK=${ANDROID_NDK_HOME:-/home/thomas/build/android-sdk/ndk/28.2.13676358}
+BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+cd "$(dirname "$0")"
+# Свои артефакты — в каталоге проекта, а не в общем ~/.build/cache/cargo-target.
+export CARGO_TARGET_DIR="$(pwd)/target"
+unset CC AR RANLIB CFLAGS CXX 2>/dev/null || true
+
+TARGETS=${*:-"aarch64-linux-android armv7-linux-androideabi x86_64-linux-android"}
+
+for t in $TARGETS; do
+  case "$t" in
+    aarch64-linux-android)
+      CC="$BIN/aarch64-linux-android35-clang"; KEY=aarch64_linux_android; TRIPLE=aarch64-linux-android35 ;;
+    armv7-linux-androideabi)
+      CC="$BIN/armv7a-linux-androideabi35-clang"; KEY=armv7_linux_androideabi; TRIPLE=armv7a-linux-androideabi35 ;;
+    x86_64-linux-android)
+      CC="$BIN/x86_64-linux-android35-clang"; KEY=x86_64_linux_android; TRIPLE=x86_64-linux-android35 ;;
+    *) echo "!! неизвестный target: $t" >&2; exit 1 ;;
+  esac
+
+  echo "=== NeXX native: $t (NDK $(basename "$NDK")) ==="
+  env \
+    "CC_${KEY}=$CC" \
+    "AR_${KEY}=$BIN/llvm-ar" \
+    "RANLIB_${KEY}=$BIN/llvm-ranlib" \
+    "CFLAGS_${KEY}=--target=$TRIPLE -fPIC" \
+    "CXX_${KEY}=${CC/clang/clang++}" \
+    cargo build --release --target "$t"
+
+  out="target/$t/release/libnexxapp.so"
+  [ -f "$out" ] && echo "OK: $out ($(stat -c%s "$out") байт)"
+done
