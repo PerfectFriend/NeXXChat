@@ -211,7 +211,7 @@ fn android_main(android_app: AndroidApp) {
                             .painter
                             .update_buffers(&g.device, &g.queue, &mut encoder, &clipped, &screen);
                         {
-                            let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("egui"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: &view,
@@ -225,7 +225,7 @@ fn android_main(android_app: AndroidApp) {
                                 timestamp_writes: None,
                                 occlusion_query_set: None,
                             });
-                            g.painter.render(&rpass.forget_lifetime(), &clipped, &screen);
+                            g.painter.render(&mut rpass.forget_lifetime(), &clipped, &screen);
                         }
                         g.queue.submit(bufs);
                         g.queue.submit(Some(encoder.finish()));

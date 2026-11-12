@@ -13,7 +13,14 @@ android {
         versionCode = 2
         versionName = "0.2.0-nexx-rust"
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            // -PnexxAbi=arm64-v8a — APK под один ABI (правило владельца: <Проект>-<abi>-debug.apk)
+            val nexxAbi = (project.findProperty("nexxAbi") as String?)
+                ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+            if (nexxAbi.isNullOrEmpty()) {
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            } else {
+                abiFilters += nexxAbi
+            }
         }
     }
 
