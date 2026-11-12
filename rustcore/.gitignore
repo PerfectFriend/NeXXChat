@@ -1,0 +1,4 @@
+target-host/
+target-android/
+src/main/jniLibs/
+build/
