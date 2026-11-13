@@ -7,14 +7,14 @@
 //! * ответы `IDS`, `MSG`, `SOK`, `OK`, `ERR`, `PONG`;
 //! * авторизация: Ed25519-подпись и deniable-authenticator
 //!   (`crypto_box(sha512(t), nonce=corrId)`);
-//! * шифрование тела сообщения: NaCl secretbox (XSalsa20-Poly1305) поверх
-//!   DH-секрета, **с тегом впереди** (как в simplexmq, не как в RustCrypto);
+//! * шифрование тела сообщения: NaCl crypto_box (XSalsa20-Poly1305) поверх
+//!   DH-секрета с pre-слоем HSalsa20(secret, 0^16), **с тегом впереди**;
 //! * паддинг `word16(len) || msg || '#'` и цепочка ключей блоков
 //!   `SimpleXSbChainInit` / `SimpleXSbChain` (HKDF-SHA512).
 //!
-//! КРИТИЧНО: порядок байт в secretbox — `tag(16) || ciphertext`, а не
-//! `ciphertext || tag`, как в RustCrypto. Это ломает совместимость, если
-//! забыть про перестановку.
+//! КРИТИЧНО: порядок байт в secretbox — `tag(16) || ciphertext` (NaCl/libsodium).
+//! Crate `crypto_secretbox` уже отдаёт этот порядок — переставлять НЕ надо
+//! (KAT-проверено против libsodium crypto_box, см. тест crypto_box_kat_matches_simplexmq).
 
 use crate::protocols::smp_wire::{put_short, put_u16, Decoder, SmpError};
 use crypto_secretbox::aead::{Aead, KeyInit};
@@ -124,21 +124,64 @@ pub fn unpad(padded: &[u8]) -> Result<Vec<u8>, SmpError> {
     Ok(padded[2..2 + len].to_vec())
 }
 
-/// NaCl secretbox (XSalsa20-Poly1305) в формате simplexmq: `tag || ciphertext`.
-pub fn crypto_box_encrypt(secret: &[u8; 32], nonce: &[u8; 24], msg: &[u8]) -> Vec<u8> {
-    let sb = XSalsa20Poly1305::new(secret.into());
-    // RustCrypto: ciphertext || tag — переставляем в порядок simplexmq.
-    let out = sb
-        .encrypt(nonce.into(), crypto_secretbox::aead::Payload::from(msg))
-        .expect("xsalsa20poly1305 encrypt");
-    let (ct, tag) = out.split_at(out.len() - 16);
-    let mut res = Vec::with_capacity(out.len());
-    res.extend_from_slice(tag);
-    res.extend_from_slice(ct);
-    res
+// ---------------------------------------------------------------------------
+// HSalsa20 и "beforenm"-слой Haskell-эталона
+// ---------------------------------------------------------------------------
+
+/// HSalsa20: ядро Salsa20 (20 раундов) без feedforward, выход — слова
+/// 0,5,10,15,6,7,8,9. Точно как `Crypto.Cipher.XSalsa` в cryptonite / NaCl.
+/// KAT-валидировано: см. тест `crypto_box_kat_matches_simplexmq`.
+pub fn hsalsa20(key: &[u8; 32], nonce: &[u8; 16]) -> [u8; 32] {
+    const SIGMA: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574]; // "expand 32-byte k"
+    let k = |i: usize| u32::from_le_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
+    let n = |i: usize| u32::from_le_bytes([nonce[4 * i], nonce[4 * i + 1], nonce[4 * i + 2], nonce[4 * i + 3]]);
+    let mut x = [
+        SIGMA[0], k(0), k(1), k(2),
+        k(3), SIGMA[1], n(0), n(1),
+        n(2), n(3), SIGMA[2], k(4),
+        k(5), k(6), k(7), SIGMA[3],
+    ];
+    macro_rules! qr {
+        ($a:expr, $b:expr, $c:expr, $d:expr) => {
+            x[$b] ^= x[$a].wrapping_add(x[$d]).rotate_left(7);
+            x[$c] ^= x[$b].wrapping_add(x[$a]).rotate_left(9);
+            x[$d] ^= x[$c].wrapping_add(x[$b]).rotate_left(13);
+            x[$a] ^= x[$d].wrapping_add(x[$c]).rotate_left(18);
+        };
+    }
+    for _ in 0..10 {
+        qr!(0, 4, 8, 12); qr!(5, 9, 13, 1); qr!(10, 14, 2, 6); qr!(15, 3, 7, 11);
+        qr!(0, 1, 2, 3); qr!(5, 6, 7, 4); qr!(10, 11, 8, 9); qr!(15, 12, 13, 14);
+    }
+    let out = [x[0], x[5], x[10], x[15], x[6], x[7], x[8], x[9]];
+    let mut r = [0u8; 32];
+    for (i, w) in out.iter().enumerate() {
+        r[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    r
 }
 
-/// Расшифровка secretbox в формате simplexmq (`tag || ciphertext`).
+/// Эквивалент первого слоя Haskell `xSalsa20` (Crypto.hs:1478):
+/// `XSalsa.initialize 20 secret (zero16 <> iv0)` ≡ HSalsa20(secret, 0^16).
+/// KAT: `cryptoBox secret nonce` == `secretbox(HSalsa20(secret,0^16), nonce)`
+/// (сверено с cryptonite vectorsCB и libsodium crypto_box).
+pub fn crypto_box_beforenm(secret: &[u8; 32]) -> [u8; 32] {
+    hsalsa20(secret, &[0u8; 16])
+}
+
+/// NaCl `crypto_box` в формате simplexmq: `tag || ciphertext`.
+/// Секрет (DH или симметричный ключ цепочки) сначала проходит через
+/// HSalsa20(secret, 0^16) — как `cryptoBox` в Haskell-ядре simplexmq.
+/// ВАЖНО: crate `crypto_secretbox` уже возвращает NaCl-порядок `tag || ct`
+/// (проверено KAT против libsodium crypto_box) — переставлять НЕ надо.
+pub fn crypto_box_encrypt(secret: &[u8; 32], nonce: &[u8; 24], msg: &[u8]) -> Vec<u8> {
+    let k = crypto_box_beforenm(secret);
+    let sb = XSalsa20Poly1305::new((&k).into());
+    sb.encrypt(nonce.into(), crypto_secretbox::aead::Payload::from(msg))
+        .expect("xsalsa20poly1305 encrypt")
+}
+
+/// Расшифровка `crypto_box` в формате simplexmq (`tag || ciphertext`).
 pub fn crypto_box_decrypt(
     secret: &[u8; 32],
     nonce: &[u8; 24],
@@ -150,12 +193,9 @@ pub fn crypto_box_decrypt(
             got: packet.len(),
         });
     }
-    let (tag, ct) = packet.split_at(16);
-    let mut buf = Vec::with_capacity(packet.len());
-    buf.extend_from_slice(ct);
-    buf.extend_from_slice(tag);
-    XSalsa20Poly1305::new(secret.into())
-        .decrypt(nonce.into(), crypto_secretbox::aead::Payload::from(buf.as_slice()))
+    let k = crypto_box_beforenm(secret);
+    XSalsa20Poly1305::new((&k).into())
+        .decrypt(nonce.into(), crypto_secretbox::aead::Payload::from(packet))
         .map_err(|_| SmpError::Crypto("secretbox: authentication failed".into()))
 }
 
@@ -856,6 +896,38 @@ mod tests {
         assert_eq!(pt, msg);
         // неверный ключ -> ошибка
         assert!(crypto_box_decrypt(&[9u8; 32], &nonce, &ct).is_err());
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// KAT: наш `crypto_box_encrypt` должен побайтово совпадать с Haskell-эталоном
+    /// simplexmq `cryptoBox` (Crypto.hs:1478), который валидирован против штатного
+    /// вектора cryptonite `tests/XSalsa.hs` (vectorsCB) и равен libsodium `crypto_box`.
+    /// Вектор ниже сгенерирован через `nacl.bindings.crypto_box(msg, nonce, pk, sk)`.
+    #[test]
+    fn crypto_box_kat_matches_simplexmq() {
+        let sk: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let pk: [u8; 32] = unhex("8f40c5adb68f25624ae5b214ea767a6ec94d829d3d7b5e1ad1ba6f3e2138285f")
+            .try_into()
+            .unwrap();
+        let nonce: [u8; 24] = unhex("05101b26313c47525d68737e89949faab5c0cbd6e1ecf702")
+            .try_into()
+            .unwrap();
+        let msg = unhex(
+            "4e65585820696e7465726f70204b415420766563746f723a2063727970746f5f626f78206d757374206d61746368204861736b656c6c2073696d706c65786d712063727970746f426f78",
+        );
+        let expected = unhex(
+            "63637da0a8921d5f6e52e9664bbfc2acfa872948cd258277282e39df81b45a899337366d5520a1d3111c427de010479308ce26b46877b1507477653a5db2702d9522c0ca9768f6b5e1d8f3e96f7e3fe96e7b4be295c05df5bf4d",
+        );
+        let dh = StaticSecret::from(sk).diffie_hellman(&X25519Public::from(pk));
+        let ct = crypto_box_encrypt(dh.as_bytes(), &nonce, &msg);
+        assert_eq!(ct, expected, "crypto_box не совпал с Haskell-эталоном simplexmq");
+        assert_eq!(crypto_box_decrypt(dh.as_bytes(), &nonce, &ct).unwrap(), msg);
     }
 
     #[test]

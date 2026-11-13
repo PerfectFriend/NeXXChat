@@ -57,19 +57,23 @@ sbcHkdf ck = ((sk,nonce), ck') where out = hkdf "" ck "SimpleXSbChain" 88
 * Наша реализация `SbChainKey::init/next` сверена **побитово** с независимой реализацией HKDF-SHA512 на Python: `ck1/ck2`, `sk`, `nonce` совпадают до байта.
 * Формат secretbox — `tag || ciphertext` (tag-first), как в `cryptoBox secret nonce s = tag <> c` ✓.
 
-### 3.3 Что НЕ сходится (блокер)
+### 3.3 Блокер расшифровки блоков — РЕШЁН (корень найден через KAT)
 
-Ответ сервера на `PING` — **зашифрованный** блок (не plaintext-ошибка: первые 64 байта — случайные данные), но Poly1305-тег не проходит.
+Симптом был: ответ сервера на `PING` не дешифровался (`secretbox: authentication failed`).
 
-Проверенные и исключённые гипотезы:
+**Корень (KAT-доказано 2026-11-13):** Haskell `cryptoBox` = `xSalsa20` (`Crypto.hs:1478`), а
+`xSalsa20 secret nonce = XSalsa.initialize 20 secret (zero16 <> iv0)` + `XSalsa.derive state0 iv1`
+эквивалентен **secretbox(key = HSalsa20(secret, 0^16), nonce)**. Наш клиент подавал сырой
+DH/ключ цепочки в XSalsa20Poly1305 напрямую (без pre-слоя HSalsa20) и к тому же переставлял
+байты tag/ct (crate `crypto_secretbox` уже отдаёт NaCl-порядок `tag||ct`).
 
-* порядок ключей цепочки (ck1/ck2), номер итерации (1-я/2-я), соль (`sessionId` / пустая) — перебор в коде, ни один вариант не подходит;
-* HKDF — совпадает побитово с эталонным расчётом;
-* session id — берётся из server hello, совпадает с тем, что сервер использует как соль;
-* DH-секрет — используется `DH(serverSessionPub, clientPriv)`, как в `C.dh' k <$!> pk_`;
-* версия — сервер отдал диапазон `6..20`, клиент выбрал v20, сервер тоже работает в v ≥ 11 (шифрование блоков включено с обеих сторон).
+Доказательство: реконструкция xSalsa20 по C-ядру cryptonite воспроизводит штатный KAT
+`cryptonite-0.30/tests/XSalsa.hs` (vectorsCB) и побайтово равна libsodium `crypto_box(pk,sk)`;
+вариант «сырой DH в secretbox» эталону не равен. В коде: `hsalsa20()` + `crypto_box_beforenm()`
+в `rustcore/src/protocols/smp.rs`, регрессионный тест `crypto_box_kat_matches_simplexmq`.
 
-Остаётся одно несовпадение в *приёме* (направление сервер→клиент), при том что *передача* клиент→сервер, судя по ответу сервера, проходит (сервер не рвёт соединение и отвечает зашифрованным блоком). Следующий шаг — снять трассировку с серверной стороны (уровень логов `Transport/Server.hs`) и/или собрать эталонный клиент simplexmq 7.0.1.0, чтобы сравнить байты первого серверного блока.
+**Результат живого прогона против `smp-ref` (v7.0.1.0, 127.0.0.1:8443, CA-пиннинг):**
+`OK connect (v20, sessionId=48B) → OK server session key (Ed25519 подпись проверена) → OK PING/PONG (2–3 мс)` — 2/2 запуска. Ранее на этом месте был `FAIL ping: decrypt block: authentication failed`.
 
 ---
 
@@ -111,17 +115,20 @@ cd ~/Projects/NeXX && ./gradlew :app:assembleDebug      # → NeXX-rust-debug.ap
 
 ```
 $ cargo test --release
-running 66 tests
-test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+running 67 tests
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
+Включая новый KAT `protocols::smp::tests::crypto_box_kat_matches_simplexmq ... ok`
+(вектор сгенерирован через libsodium `crypto_box`, равен KAT-валидированному Haskell-эталону).
 
-Живая проверка против `smp-ref` (smp-server v7.0.1.0):
+Живая проверка против `smp-ref` (smp-server v7.0.1.0, 127.0.0.1:8443, пиннинг по CA из `/etc/opt/simplex/ca.crt`):
 
 ```
 === NeXX SMP interop smoke: 127.0.0.1:8443 ===
-OK  connect: version=v20, sessionId=48B, keyHash=06b671d5e28a70b31398685cc1d4b0660f6de2f9bd6dcebd83afdd5192f49cae
+OK  connect: version=v20, sessionId=48B, keyHash=2895b70987e4e6d8661d35a804d056d0d877d4ed3dd7b2e7a7e359b597ec9ed3
 OK  server session key: <64 hex>          ← подпись Ed25519 проверена, ключ извлечён
-FAIL ping: decrypt block: crypto error: secretbox: authentication failed   ← блокер
+OK  PING/PONG (2–3 ms)                     ← блокер расшифровки блоков снят (2/2 запуска)
+FAIL NEW: TLS read: Resource temporarily unavailable (os error 11)   ← таймаут чтения, не крипто-ошибка
 ```
 
 Дополнительно подтверждено:
@@ -132,13 +139,11 @@ FAIL ping: decrypt block: crypto error: secretbox: authentication failed   ← �
 
 ## 10. Блокеры и следующие шаги
 
-**Блокер (1 шт., транспортный слой):** расшифровка первого серверного блока (`PING` → `PONG`).
+**Старый транспортный блокер (дешифровка блоков) — снят**, корень был в крипто-слое (см. §3.3): нужен pre-слой `HSalsa20(secret, 0^16)` и НЕ нужен swap байтов tag/ct. PING/PONG против эталона проходит.
 
-План:
-1. Снять серверные логи `Transport/Server.hs` на `smp-ref` (уровень `NOTE/INFO`) во время прогона хары — должен быть виден результат дешифрования блока клиента.
-2. Собрать/использовать эталонный клиент simplexmq 7.0.1.0 и сравнить первые байты серверного блока (chain key/nonce) с нашими — это однозначно покажет, где расходится порядок вывода ключа.
-3. Проверить гипотезу «сервер использует salt=`sessionId` из THandleParams, а не из hello» и вариант, что серверный `snd` — это вторая итерация цепочки (если сервер уже шифровал служебный блок).
-4. После расшифровки — довести хару до полного цикла (PING → NEW → SEND самому себе → GET → ACK) и повторить на публичных релеях с закреплёнными keyHash.
+**Текущий открытый пункт (не крипто):** на команде `NEW` smoke-клиент падает с `TLS read: Resource temporarily unavailable` — таймаут чтения ответа, сервер соединение не рвёт. Гипотезы: (а) у smoke таймаут чтения слишком мал для создания очереди; (б) формат тела `NEW` (auth-блок/queue-req) чуть расходится и сервер молча ждёт. Следующий шаг: увеличить read-timeout в `smp_smoke.rs`/`tls_read_exact` и снять лог `smp-ref` на время прогона.
+
+Далее: довести хару до полного цикла (PING → NEW → SEND самому себе → GET → ACK → DEL) и повторить на публичных релеях (`smp6/smp8/smp10.simplex.im:443`) с закреплёнными keyHash — до сих пор публичный прогон **не верифицирован**.
 
 **Вне блокера (не влияет на протокол):** APK собирается и доставляется; UI/навигация и клавиатурный слой — по ранее зафиксированному состоянию.
 
