@@ -163,7 +163,14 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - Пиннинг CA на 5223 — цепочка с порта 5223 (`smp6-5223-chain.pem`: leaf `CN=smp6.simplex.im` + `CN=SMP server CA`), не CDN-цепочка с 443. keyHash из SMP hello = SHA-256 CA.
 - Запуск: `NEXX_TLS=openssl smp_smoke smp6.simplex.im:5223 "msg" smp6-5223-chain.pem`. Диагностика: `hello_probe`, `tls_probe`.
 
-Далее: XFTP (v3) прогон против публичного XFTP-релея и agent-level handshake (HELLO/INV etc.) поверх SMP.
+Далее: XFTP (v3) прогон против публичного XFTP-релея — **ВЫПОЛНЕНО (2026-11-14), `XFTP INTEROP OK` на `xftp1.simplex.im:443`** (бинарник `xftp_smoke`, tokio-openssl + h2):
+- TLS 1.3 без SNI (со SNI релей отдаёт web), ALPN `xftp/1`; sessionId = client TLS Finished (48B, v7.1+); keyHash = SHA-256(CA DER) из `xftp://keyHash@host`.
+- Handshake v4: empty POST → serverHello (vRange 1..4) → clientHello (v + keyHash + '0') → пустой ответ.
+- Команды — HTTP/2 POST, блок 16384B: `u16 len + 0x01 + u16 + auth + transmission`, transmission = `short(sessionId)+short(corrId 24B)+short(entityId)+cmd`; подпись Ed25519 над всей transmission.
+- FNEW (sndKey + rcvKeys, size = размер bodyPart = 64KB packet, digest = **SHA-256** тела) → SIDS; FPUT (body = block + шифротекст) → OK; FGET (rcvId + rDhKey, подписано rcv) → FILE sDhKey cbNonce + body; FDEL → OK.
+- Слои шифрования файла: внешний router→recipient = crypto_box stream = `HSalsa20(DH,0^16)` пре-слой + XSalsa20Poly1305, формат **ct||tail-tag**; внутренний (sender) = raw secretbox. Roundtrip 64KB: контент совпал.
+
+Далее: agent-level handshake (HELLO/INV/ADR поверх SMP) — клиент-агент SimpleX.
 
 **Вне протокола:** APK собирается и доставляется; UI/клавиатура — по ранее зафиксированному состоянию.
 
