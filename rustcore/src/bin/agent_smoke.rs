@@ -20,6 +20,54 @@ fn put_i64(out: &mut Vec<u8>, v: i64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+/// shortString
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.push(s.len() as u8);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// smpRouter = hosts port keyHash ; hosts = length 1*host
+fn smp_router(out: &mut Vec<u8>, host: &str, port: &str, key_hash_b64: &str) {
+    out.push(1); // hosts: 1 host
+    put_str(out, host);
+    put_str(out, port);
+    put_str(out, key_hash_b64);
+}
+
+/// sndQueueAddr = smpRouter senderId
+fn snd_queue_addr(out: &mut Vec<u8>, host: &str, port: &str, key_hash_b64: &str, sender_id: &[u8]) {
+    smp_router(out, host, port, key_hash_b64);
+    out.push(sender_id.len() as u8);
+    out.extend_from_slice(sender_id);
+}
+
+/// newQueueUri = clientVRange smpRouter senderId dhPublicKey queueMode
+fn new_queue_uri(out: &mut Vec<u8>, host: &str, port: &str, key_hash_b64: &str, sender_id: &[u8], dh_x509: &[u8]) {
+    out.extend_from_slice(&6u16.to_be_bytes()); // vRange min
+    out.extend_from_slice(&20u16.to_be_bytes()); // vRange max
+    smp_router(out, host, port, key_hash_b64);
+    out.push(sender_id.len() as u8);
+    out.extend_from_slice(sender_id);
+    out.push(dh_x509.len() as u8);
+    out.extend_from_slice(dh_x509);
+    out.push(b'M'); // queueMode M
+}
+
+/// newQueueInfo = version smpRouter senderId dhPublicKey queueMode
+fn new_queue_info(out: &mut Vec<u8>, host: &str, port: &str, key_hash_b64: &str, sender_id: &[u8], dh_x509: &[u8]) {
+    out.extend_from_slice(&20u16.to_be_bytes()); // version
+    smp_router(out, host, port, key_hash_b64);
+    out.push(sender_id.len() as u8);
+    out.extend_from_slice(sender_id);
+    out.push(dh_x509.len() as u8);
+    out.extend_from_slice(dh_x509);
+    out.push(b'M');
+}
+
 /// smpEncode ByteString (MsgHash): 1-байт длина + байты.
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.push(b.len() as u8);
@@ -161,9 +209,79 @@ fn main() {
         });
     println!("OK  SEND agent A_MSG accepted");
 
-    // --- Принимаем оба сообщения и проверяем agent-фрейм ---
+    // --- Команды ротации/квитанций: QADD/QKEY/QUSE/QTEST/A_RCVD/EREADY ---
+    let host = addr.host.clone();
+    let port = addr.port.to_string();
+    let key_hash = "lrzsBiZJdvN0YHeazyjFp8_oo8Cq4RqP_O4FwL3fCMY="; // SHA-256 CA smp6 (из SMP hello)
+    let dh_x509 = nexxrust::protocols::smp::x25519_x509(sender_eph_pub.as_bytes());
+    let snd_key_x509 = nexxrust::protocols::smp::ed25519_x509(auth_signing.verifying_key().as_bytes());
+
+    // QADD = "QA" 1*(newQueueUri replacedSndQueue)
+    let mut qa = b"QA".to_vec();
+    qa.push(1);
+    new_queue_uri(&mut qa, &host, &port, key_hash, &ids.snd_id, &dh_x509);
+    qa.push(b'0'); // replacedSndQueue: "0" + sndQueueAddr
+    snd_queue_addr(&mut qa, &host, &port, key_hash, &ids.snd_id);
+
+    // QKEY = "QK" 1*(newQueueInfo senderKey)
+    let mut qk = b"QK".to_vec();
+    qk.push(1);
+    new_queue_info(&mut qk, &host, &port, key_hash, &ids.snd_id, &dh_x509);
+    qk.push(snd_key_x509.len() as u8);
+    qk.extend_from_slice(&snd_key_x509);
+
+    // QUSE = "QU" 1*(sndQueueAddr primary)
+    let mut qu = b"QU".to_vec();
+    qu.push(1);
+    snd_queue_addr(&mut qu, &host, &port, key_hash, &ids.snd_id);
+    qu.push(b'T');
+
+    // QTEST = "QT" 1*sndQueueAddr
+    let mut qt = b"QT".to_vec();
+    qt.push(1);
+    snd_queue_addr(&mut qt, &host, &port, key_hash, &ids.snd_id);
+
+    // A_RCVD = "V" 1*msgReceipt ; msgReceipt = agentMsgId msgHash rcptLength rcptInfo
+    let mut v = b"V".to_vec();
+    v.push(1);
+    put_i64(&mut v, 2); // agentMsgId
+    v.push(32);
+    v.extend_from_slice(&h); // msgHash
+    let rcpt_info = b"rcpt";
+    put_u16(&mut v, rcpt_info.len() as u16);
+    v.extend_from_slice(rcpt_info);
+
+    // EREADY = "E" agentMsgId
+    let mut e = b"E".to_vec();
+    put_i64(&mut e, 3);
+
+    let cmds: Vec<(&str, Vec<u8>)> = vec![
+        ("QADD", qa), ("QKEY", qk), ("QUSE", qu), ("QTEST", qt), ("A_RCVD", v), ("EREADY", e),
+    ];
+    let mut prev_hash = h;
+    for (i, (name, body)) in cmds.iter().enumerate() {
+        let env = agent_msg_envelope(3 + i as i64, &prev_hash, body);
+        prev_hash = nexxrust::crypto::sha256_raw(&env).try_into().unwrap();
+        send_agent_msg(&mut client, &ids.snd_id, e2e_secret.as_bytes(), sender_eph_pub.as_bytes(), &env)
+            .unwrap_or_else(|e| {
+                println!("FAIL SEND {name}: {e}");
+                std::process::exit(1);
+            });
+        println!("OK  SEND agent {name} accepted");
+    }
+
+    // --- Принимаем все сообщения и проверяем agent-фрейм ---
     let mut pending_msgs: Vec<Vec<u8>> = Vec::new();
-    for expect in [("HELLO", "H"), ("A_MSG", "M")] {
+    for expect in [
+        ("HELLO", "H"),
+        ("A_MSG", "M"),
+        ("QADD", "QA"),
+        ("QKEY", "QK"),
+        ("QUSE", "QU"),
+        ("QTEST", "QT"),
+        ("A_RCVD", "V"),
+        ("EREADY", "E"),
+    ] {
         let msg_cmd = if let Some(m) = pending_msgs.pop() {
             m
         } else {
@@ -239,7 +357,7 @@ fn main() {
         }
         pending_msgs.extend(client.take_pending());
     }
-    println!("OK  ACK both messages");
+    println!("OK  ACK all messages");
 
     client.delete_queue(&ids.rcv_id, &auth_signing).unwrap_or_else(|e| {
         println!("FAIL DEL: {e}");
