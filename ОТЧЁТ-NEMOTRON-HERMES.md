@@ -170,7 +170,10 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - FNEW (sndKey + rcvKeys, size = размер bodyPart = 64KB packet, digest = **SHA-256** тела) → SIDS; FPUT (body = block + шифротекст) → OK; FGET (rcvId + rDhKey, подписано rcv) → FILE sDhKey cbNonce + body; FDEL → OK.
 - Слои шифрования файла: внешний router→recipient = crypto_box stream = `HSalsa20(DH,0^16)` пре-слой + XSalsa20Poly1305, формат **ct||tail-tag**; внутренний (sender) = raw secretbox. Roundtrip 64KB: контент совпал.
 
-Далее: agent-level handshake (HELLO/INV/ADR поверх SMP) — клиент-агент SimpleX.
+Далее: agent-level handshake (HELLO/INV/ADR поверх SMP) — клиент-агент SimpleX — **ВЫПОЛНЕНО (2026-11-14), `AGENT INTEROP OK` на `smp6.simplex.im:5223`** (бинарник `agent_smoke`):
+- Полный loopback: connect v20 → PING/PONG → NEW→IDS → SEND HELLO → SEND A_MSG → recv MSG type=H → recv MSG type=MN с **дешифрованным телом** `"NeXX agent A_MSG roundtrip!"` → ACK обоих → DEL→OK (848 мс).
+- Нюанс протокола: сервер доставляет следующее `MSG` **в том же batch, что и ответ на ACK** (corrId = corrId команды) — клиент обязан принимать `MSG` как валидный ответ на ACK и складывать его в pending, а не падать.
+- Команды агента кодируются как `("H",)` / `A_MSG_`-фрейм поверх SMP SEND; дешифровка E2E — crypto_box слой из §3.3, сходится с публичным релеем побитово.
 
 **Вне протокола:** APK собирается и доставляется; UI/клавиатура — по ранее зафиксированному состоянию.
 
