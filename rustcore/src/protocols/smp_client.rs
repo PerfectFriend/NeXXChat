@@ -27,8 +27,8 @@ use crate::protocols::smp::{
     verify_server_signed_key, x25519_x509, QueueIds, RecipientKeys, SbChainKey, ServerResponse,
 };
 use crate::protocols::smp_wire::{
-    decode_batch, decode_block, decode_transmission, encode_batch, encode_client_hello,
-    encode_block, encode_transmission, new_corr_id, put_short, ClientHello, Transmission,
+    decode_batch, decode_block, decode_transmission_v, encode_batch, encode_client_hello,
+    encode_block, encode_transmission_v, new_corr_id, put_short, ClientHello, Transmission,
     BLOCK_SIZE,
 };
 
@@ -561,7 +561,7 @@ impl SmpClient {
             entity_id,
             command,
         };
-        let encoded = encode_transmission(&t).map_err(|e| format!("encode transmission: {e}"))?;
+        let encoded = encode_transmission_v(self.version, &t).map_err(|e| format!("encode transmission: {e}"))?;
         let batch = encode_batch(&[encoded]).map_err(|e| format!("encode batch: {e}"))?;
         self.write_block(&batch)?;
         Ok(corr_id)
@@ -573,7 +573,7 @@ impl SmpClient {
         let items = decode_batch(&batch).map_err(|e| format!("decode batch: {e}"))?;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            let t = decode_transmission(&item).map_err(|e| format!("decode transmission: {e}"))?;
+            let t = decode_transmission_v(self.version, &item).map_err(|e| format!("decode transmission: {e}"))?;
             out.push((
                 t.authenticator.to_vec(),
                 t.corr_id.to_vec(),
@@ -616,7 +616,7 @@ impl SmpClient {
             entity_id: b"",
             command: &cmd,
         };
-        let encoded = encode_transmission(&t).map_err(|e| format!("encode ping: {e}"))?;
+        let encoded = encode_transmission_v(self.version, &t).map_err(|e| format!("encode ping: {e}"))?;
         let batch = encode_batch(&[encoded]).map_err(|e| format!("encode batch: {e}"))?;
         self.write_block(&batch)?;
         match self.wait_response(&corr_id)? {
@@ -641,7 +641,7 @@ impl SmpClient {
             entity_id: b"",
             command: &cmd,
         };
-        let encoded = encode_transmission(&t).map_err(|e| format!("encode transmission: {e}"))?;
+        let encoded = encode_transmission_v(self.version, &t).map_err(|e| format!("encode transmission: {e}"))?;
         let batch = encode_batch(&[encoded]).map_err(|e| format!("encode batch: {e}"))?;
         self.write_block(&batch)?;
         match self.wait_response(&corr_id)? {
@@ -685,7 +685,7 @@ impl SmpClient {
             entity_id: rcv_id,
             command: &cmd,
         };
-        let encoded = encode_transmission(&t).map_err(|e| format!("encode transmission: {e}"))?;
+        let encoded = encode_transmission_v(self.version, &t).map_err(|e| format!("encode transmission: {e}"))?;
         let batch = encode_batch(&[encoded]).map_err(|e| format!("encode batch: {e}"))?;
         self.write_block(&batch)?;
         match self.wait_response(&corr_id)? {
@@ -706,7 +706,7 @@ impl SmpClient {
             entity_id: rcv_id,
             command: &cmd,
         };
-        let encoded = encode_transmission(&t).map_err(|e| format!("encode transmission: {e}"))?;
+        let encoded = encode_transmission_v(self.version, &t).map_err(|e| format!("encode transmission: {e}"))?;
         let batch = encode_batch(&[encoded]).map_err(|e| format!("encode batch: {e}"))?;
         self.write_block(&batch)?;
         match self.wait_response(&corr_id)? {
@@ -732,7 +732,7 @@ impl SmpClient {
             entity_id: rcv_id,
             command: &cmd,
         };
-        let encoded = encode_transmission(&t).map_err(|e| format!("encode transmission: {e}"))?;
+        let encoded = encode_transmission_v(self.version, &t).map_err(|e| format!("encode transmission: {e}"))?;
         let batch = encode_batch(&[encoded]).map_err(|e| format!("encode batch: {e}"))?;
         self.write_block(&batch)?;
         match self.wait_response(&corr_id)? {
@@ -814,7 +814,7 @@ impl SmpClient {
             entity_id,
             command,
         };
-        encode_transmission(&t).map_err(|e| format!("encode transmission: {e}"))
+        encode_transmission_v(self.version, &t).map_err(|e| format!("encode transmission: {e}"))
     }
 }
 

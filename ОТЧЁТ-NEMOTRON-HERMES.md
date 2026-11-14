@@ -72,8 +72,29 @@ DH/ключ цепочки в XSalsa20Poly1305 напрямую (без pre-сл
 вариант «сырой DH в secretbox» эталону не равен. В коде: `hsalsa20()` + `crypto_box_beforenm()`
 в `rustcore/src/protocols/smp.rs`, регрессионный тест `crypto_box_kat_matches_simplexmq`.
 
-**Результат живого прогона против `smp-ref` (v7.0.1.0, 127.0.0.1:8443, CA-пиннинг):**
-`OK connect (v20, sessionId=48B) → OK server session key (Ed25519 подпись проверена) → OK PING/PONG (2–3 мс)` — 2/2 запуска. Ранее на этом месте был `FAIL ping: decrypt block: authentication failed`.
+**Результат живого прогона против `smp-ref` (v7.0.1.0, 127.0.0.1:443, CA-пиннинг), после двух фиксов (крипто-слой + serviceSig, см. ниже) — ПОЛНЫЙ ЦИКЛ:
+
+```
+OK  connect: version=v20, sessionId=48B, keyHash=2895b709...
+OK  server session key: <Ed25519, подпись проверена>
+OK  PING/PONG
+OK  NEW -> IDS: rcvId=... sndId=...
+OK  SEND accepted by server
+OK  MSG received: msgId=... ts=... flags=F
+OK  payload decrypted and matches: "final-clean"   ← E2E crypto_box через DH(rcvDhPub, senderEph)
+OK  ACK accepted
+OK  DEL queue
+=== INTEROP OK in 86 ms ===
+```
+
+**Второй корень (найден живым прогоном):** при v≥16 (`serviceCertsSMPVersion = 16`,
+`serviceAuth=true` в `THandleParams`) transmission с **непустым authenticator** должен
+содержать после него байт `serviceSig` (`'0'` = нет сервисной подписи). Без него серверный
+`transmissionP` читает corrId-length как tag Maybe → parse fail → `ERR BLOCK` с пустым
+corrId. Поэтому PING (пустой auth) проходил, а подписанный NEW — нет. Фикс:
+`encode_transmission_v(version, t)` / `decode_transmission_v` в `smp_wire.rs` (пишем `'0'`
+при v≥16 и непустом auth), клиент вызывает с `self.version`; юнит-тест
+`service_sig_byte_present_for_signed_transmission_v16_plus`.
 
 ---
 
@@ -115,21 +136,11 @@ cd ~/Projects/NeXX && ./gradlew :app:assembleDebug      # → NeXX-rust-debug.ap
 
 ```
 $ cargo test --release
-running 67 tests
-test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 68 passed; 0 failed   (вкл. KAT crypto_box и serviceSig layout)
 ```
-Включая новый KAT `protocols::smp::tests::crypto_box_kat_matches_simplexmq ... ok`
-(вектор сгенерирован через libsodium `crypto_box`, равен KAT-валидированному Haskell-эталону).
 
-Живая проверка против `smp-ref` (smp-server v7.0.1.0, 127.0.0.1:8443, пиннинг по CA из `/etc/opt/simplex/ca.crt`):
-
-```
-=== NeXX SMP interop smoke: 127.0.0.1:8443 ===
-OK  connect: version=v20, sessionId=48B, keyHash=2895b70987e4e6d8661d35a804d056d0d877d4ed3dd7b2e7a7e359b597ec9ed3
-OK  server session key: <64 hex>          ← подпись Ed25519 проверена, ключ извлечён
-OK  PING/PONG (2–3 ms)                     ← блокер расшифровки блоков снят (2/2 запуска)
-FAIL NEW: TLS read: Resource temporarily unavailable (os error 11)   ← таймаут чтения, не крипто-ошибка
-```
+Живой прогон против `smp-ref` (v7.0.1.0, 127.0.0.1:443): полный цикл
+PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпал) → ACK/OK → DEL/OK — `INTEROP OK in 86 ms`.
 
 Дополнительно подтверждено:
 * fingerprint сервера из его лога (`BrZx1e…nK4=`) **==** наш keyHash (SHA-256 от CA-сертификата) → identity-часть handshake принимается сервером;
@@ -139,13 +150,15 @@ FAIL NEW: TLS read: Resource temporarily unavailable (os error 11)   ← тай�
 
 ## 10. Блокеры и следующие шаги
 
-**Старый транспортный блокер (дешифровка блоков) — снят**, корень был в крипто-слое (см. §3.3): нужен pre-слой `HSalsa20(secret, 0^16)` и НЕ нужен swap байтов tag/ct. PING/PONG против эталона проходит.
+**Все транспортные блокеры сняты.** Два корня, оба найдены живым прогоном против эталона и закрыты регрессионными тестами:
+1. крипто-слой блоков: нужен pre-слой `HSalsa20(secret, 0^16)`, tag идёт первым (`tag||ct`) — см. §3.3;
+2. framing: при v≥16 после непустого authenticator обязателен байт `serviceSig` (`'0'`) — иначе сервер отвечает `ERR BLOCK`.
 
-**Текущий открытый пункт (не крипто):** на команде `NEW` smoke-клиент падает с `TLS read: Resource temporarily unavailable` — таймаут чтения ответа, сервер соединение не рвёт. Гипотезы: (а) у smoke таймаут чтения слишком мал для создания очереди; (б) формат тела `NEW` (auth-блок/queue-req) чуть расходится и сервер молча ждёт. Следующий шаг: увеличить read-timeout в `smp_smoke.rs`/`tls_read_exact` и снять лог `smp-ref` на время прогона.
+Полный цикл против `smp-ref` v7.0.1.0 проходит: PING → NEW/IDS → SEND → MSG (E2E payload дешифрован и совпал) → ACK → DEL (`INTEROP OK`).
 
-Далее: довести хару до полного цикла (PING → NEW → SEND самому себе → GET → ACK → DEL) и повторить на публичных релеях (`smp6/smp8/smp10.simplex.im:443`) с закреплёнными keyHash — до сих пор публичный прогон **не верифицирован**.
+**Следующий шаг:** тот же прогон на публичных релеях (`smp6/smp8/smp10.simplex.im:443`) с закреплёнными keyHash — до сих пор публичный прогон **не верифицирован**. Далее: XFTP (v3) прогон и agent-level handshake (HELLO/INV etc.) поверх SMP.
 
-**Вне блокера (не влияет на протокол):** APK собирается и доставляется; UI/навигация и клавиатурный слой — по ранее зафиксированному состоянию.
+**Вне протокола:** APK собирается и доставляется; UI/клавиатура — по ранее зафиксированному состоянию.
 
 ---
 

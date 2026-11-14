@@ -372,20 +372,52 @@ impl<'a> Transmission<'a> {
     }
 }
 
-/// Кодирует transmission.
-pub fn encode_transmission(t: &Transmission<'_>) -> Result<Vec<u8>, SmpError> {
+/// Версия протокола, с которой transmission с непустым authenticator
+/// содержит опциональную подпись сервиса (`serviceSig`) после authenticator
+/// (см. simplexmq `serviceCertsSMPVersion = 16`, `transmissionP` в Protocol.hs).
+pub const SERVICE_CERTS_VERSION: u16 = 16;
+
+/// Кодирует transmission для версии протокола `version`.
+///
+/// При `version >= 16` и непустом authenticator после него идёт `serviceSig`
+/// (`'0'` = нет подписи сервиса, `'1'` + shortString(подпись)) — без этого
+/// сервер отвечает `ERR BLOCK`.
+pub fn encode_transmission_v(version: u16, t: &Transmission<'_>) -> Result<Vec<u8>, SmpError> {
     let mut out = Vec::new();
     put_short(&mut out, t.authenticator)?;
+    if version >= SERVICE_CERTS_VERSION && !t.authenticator.is_empty() {
+        // serviceSig = Nothing (у нас нет сервисных credentials)
+        out.push(b'0');
+    }
     put_short(&mut out, t.corr_id)?;
     put_short(&mut out, t.entity_id)?;
     out.extend_from_slice(t.command);
     Ok(out)
 }
 
-/// Разбирает transmission.
-pub fn decode_transmission(buf: &[u8]) -> Result<Transmission<'_>, SmpError> {
+/// Кодирует transmission (актуальная версия протокола, v>=16).
+pub fn encode_transmission(t: &Transmission<'_>) -> Result<Vec<u8>, SmpError> {
+    encode_transmission_v(20, t)
+}
+
+/// Разбирает transmission для версии протокола `version`.
+///
+/// При `version >= 16` и непустом authenticator пропускает байт `serviceSig`
+/// (`'0'`, либо `'1'` + shortString).
+pub fn decode_transmission_v(version: u16, buf: &[u8]) -> Result<Transmission<'_>, SmpError> {
     let mut d = Decoder::new(buf);
     let authenticator = d.short()?;
+    if version >= SERVICE_CERTS_VERSION && !authenticator.is_empty() {
+        let tag = d.u8()?;
+        if tag == b'1' {
+            let _sig = d.short()?;
+        } else if tag != b'0' {
+            return Err(SmpError::BadLength {
+                expected: Some(b'0' as usize),
+                got: tag as usize,
+            });
+        }
+    }
     let corr_id = d.short()?;
     let entity_id = d.short()?;
     let command = d.tail();
@@ -395,6 +427,11 @@ pub fn decode_transmission(buf: &[u8]) -> Result<Transmission<'_>, SmpError> {
         entity_id,
         command,
     })
+}
+
+/// Разбирает transmission (актуальная версия протокола, v>=16).
+pub fn decode_transmission(buf: &[u8]) -> Result<Transmission<'_>, SmpError> {
+    decode_transmission_v(20, buf)
 }
 
 /// Байты, которые подписываются Ed25519-подписью команды:
@@ -550,6 +587,34 @@ mod tests {
         let back = decode_transmission(&bytes).unwrap();
         assert_eq!(back, t);
         assert_eq!(back.command, cmd);
+    }
+
+    #[test]
+    fn service_sig_byte_present_for_signed_transmission_v16_plus() {
+        // v>=16: после непустого authenticator идёт serviceSig ('0' = Nothing).
+        // Без этого байта сервер (v>=16) отвечает ERR BLOCK — поймано живым прогоном.
+        let auth = [0xABu8; 64];
+        let t = Transmission {
+            authenticator: &auth,
+            corr_id: b"0123456789abcdef01234567",
+            entity_id: b"",
+            command: b"NEW ...",
+        };
+        let v20 = encode_transmission_v(20, &t).unwrap();
+        // layout: 0x40 + 64 sig + '0' + 0x18 + 24 corr + 0x00 + cmd
+        assert_eq!(v20[0], 64);
+        assert_eq!(v20[65], b'0');
+        assert_eq!(v20[66], 24);
+        let back = decode_transmission_v(20, &v20).unwrap();
+        assert_eq!(back.authenticator, &auth[..]);
+        assert_eq!(back.corr_id, b"0123456789abcdef01234567");
+        // v15: serviceSig отсутствует
+        let v15 = encode_transmission_v(15, &t).unwrap();
+        assert_eq!(v15[65], 24); // сразу corrId length
+        // пустой authenticator (PING) — serviceSig нет даже на v20
+        let ping = encode_transmission_v(20, &Transmission::new(b"0123456789abcdef01234567", b"", b"PING")).unwrap();
+        assert_eq!(ping[0], 0);
+        assert_eq!(ping[1], 24);
     }
 
     #[test]

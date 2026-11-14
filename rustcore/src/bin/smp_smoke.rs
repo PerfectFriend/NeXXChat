@@ -128,14 +128,14 @@ fn main() {
     let cmd = nexxrust::protocols::smp::cmd_send(false, &envelope);
     let corr_id = nexxrust::protocols::smp_wire::new_corr_id();
     {
-        use nexxrust::protocols::smp_wire::{encode_batch, encode_transmission, Transmission};
+        use nexxrust::protocols::smp_wire::{encode_batch, encode_transmission_v, Transmission};
         let t = Transmission {
             authenticator: b"",
             corr_id: &corr_id,
             entity_id: &ids.snd_id,
             command: &cmd,
         };
-        let enc = match encode_transmission(&t) {
+        let enc = match encode_transmission_v(client.version, &t) {
             Ok(e) => e,
             Err(e) => {
                 println!("FAIL encode transmission: {e}");
