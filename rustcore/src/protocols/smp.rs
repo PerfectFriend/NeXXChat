@@ -45,6 +45,11 @@ pub const ED25519_SPKI_PREFIX: [u8; 12] = [
 pub const X25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
 ];
+/// SPKI-префикс Ed448 (X.509 SubjectPublicKeyInfo). Публичные релеи SimpleX
+/// v7.1+ используют Ed448-сертификаты (и требуют ed448 в sigalgs ClientHello).
+pub const ED448_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x43, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x3a, 0x00,
+];
 
 // ---------------------------------------------------------------------------
 // X.509 / SPKI
@@ -88,6 +93,19 @@ pub fn parse_ed25519_x509(der: &[u8]) -> Option<[u8; 32]> {
 /// X25519 public key из DER (сертификат или SPKI).
 pub fn parse_x25519_x509(der: &[u8]) -> Option<[u8; 32]> {
     parse_spki(der, &X25519_SPKI_PREFIX)
+}
+
+/// Ed448 public key (57 байт) из DER (сертификат или SPKI).
+pub fn parse_ed448_x509(der: &[u8]) -> Option<[u8; 57]> {
+    let pos = der
+        .windows(12)
+        .position(|w| w == ED448_SPKI_PREFIX.as_slice())?;
+    if der.len() < pos + 69 {
+        return None;
+    }
+    let mut key = [0u8; 57];
+    key.copy_from_slice(&der[pos + 12..pos + 69]);
+    Some(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -738,25 +756,32 @@ pub fn parse_server_hello(block: &[u8]) -> Result<ServerHelloInfo, SmpError> {
 
 /// Извлекает X25519-ключ сервера из DER подписанного объекта.
 ///
-/// `signed_object` — DER структуры `Signed { signedObject OCTET STRING,
-/// signedAlg SEQUENCE, signedSignature BIT STRING }`; внутри `signedObject`
-/// лежит X.509 SPKI X25519-ключа.
-pub fn extract_signed_pubkey(signed_der: &[u8]) -> Option<([u8; 32], Vec<u8>, Vec<u8>)> {
+/// Возвращает `(pubkey, candidates, signature)`, где `candidates` — возможные
+/// байты, которые сервер мог подписать (зависит от обёртки: OCTET STRING у
+/// v7.0.x, голый SPKI SEQUENCE у публичных v7.1+).
+pub fn extract_signed_pubkey(signed_der: &[u8]) -> Option<([u8; 32], Vec<Vec<u8>>, Vec<u8>)> {
     // SEQUENCE { signedObject, alg+signature }
     let (_, content, _) = der_tlv(signed_der)?;
     let (obj_tag, obj_content, rest) = der_tlv(content)?;
     // signedObject бывает OCTET STRING (0x04) либо явным SEQUENCE (0x30) с SPKI.
-    let signed_object_bytes: Vec<u8> = match obj_tag {
-        0x04 => obj_content.to_vec(),
-        0x30 => obj_content.to_vec(),
-        _ => return None,
-    };
+    if obj_tag != 0x04 && obj_tag != 0x30 {
+        return None;
+    }
     let signature = find_signature(rest, 0)?;
-    // В Haskell (crypton-x509) подписывается `Start Sequence : toASN1 object`,
-    // то есть SPKI с дополнительной обёрткой SEQUENCE (46 байт вместо 44).
-    let signed_object_bytes = der_wrap_sequence(&obj_content);
-    let pubkey = parse_x25519_x509(&obj_content)?;
-    Some((pubkey, signed_object_bytes, signature))
+    let pubkey = parse_x25519_x509(obj_content)?;
+    // Канонический DER первого TLV (с заголовком).
+    let full_len = signed_der.len() - content.len() + 0; // не используем; считаем напрямую ниже
+    let _ = full_len;
+    let hdr_len = content.len() - obj_content.len() - rest.len();
+    let full_tlv = &content[..hdr_len + obj_content.len()];
+    let mut candidates = vec![
+        der_wrap_sequence(obj_content), // SEQUENCE(контент) — вариант v7.0.x
+        full_tlv.to_vec(),              // голый TLV (SPKI) — вариант v7.1+
+        der_wrap_sequence(full_tlv),    // SEQUENCE(TLV)
+        obj_content.to_vec(),           // голый контент
+    ];
+    candidates.dedup();
+    Some((pubkey, candidates, signature))
 }
 
 /// Оборачивает DER-объект в SEQUENCE (как `Start Sequence : ...` в Haskell).
@@ -842,19 +867,36 @@ pub fn verify_server_signed_key(
     signed_object_bytes: &[u8],
     signature: &[u8],
 ) -> bool {
-    let cert_key = match parse_ed25519_x509(cert_der) {
-        Some(k) => k,
-        None => return false,
-    };
-    let vk = match VerifyingKey::from_bytes(&cert_key) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let sig = match Signature::from_slice(signature) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    vk.verify(signed_object_bytes, &sig).is_ok()
+    // Ed25519-сертификат (локальные/старые серверы) — через ed25519-dalek.
+    if let Some(cert_key) = parse_ed25519_x509(cert_der) {
+        let vk = match VerifyingKey::from_bytes(&cert_key) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let sig = match Signature::from_slice(signature) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        return vk.verify(signed_object_bytes, &sig).is_ok();
+    }
+    // Ed448-сертификат (публичные релеи v7.1+) — через openssl (ed25519-dalek
+    // Ed448 не поддерживает). Подпись Ed448 = 114 байт.
+    if let Some(k) = parse_ed448_x509(cert_der) {
+        let mut spki = ED448_SPKI_PREFIX.to_vec();
+        spki.extend_from_slice(&k);
+        let pkey = match openssl::pkey::PKey::public_key_from_der(&spki) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let mut verifier = match openssl::sign::Verifier::new_without_digest(&pkey) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        return verifier
+            .verify_oneshot(signature, signed_object_bytes)
+            .unwrap_or(false);
+    }
+    false
 }
 
 #[cfg(test)]

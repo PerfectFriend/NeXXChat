@@ -37,6 +37,57 @@ pub const CLIENT_MAX_VERSION: u16 = 20;
 
 type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 
+/// Абстракция TLS-потока: позволяет выбирать бэкенд (rustls для локальных
+/// серверов, openssl — для публичных релеев, см. connect_openssl_with_ca).
+pub trait TlsIo: Send {
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()>;
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
+    fn flush(&mut self) -> std::io::Result<()>;
+}
+
+impl TlsIo for TlsStream {
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        Read::read_exact(self, buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        Write::write_all(self, buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Write::flush(self)
+    }
+}
+
+impl TlsIo for Box<dyn TlsIo> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        (**self).read_exact(buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        (**self).write_all(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (**self).flush()
+    }
+}
+
+/// TLS-поток на openssl. Нужен для публичных релеев SimpleX: их hs-tls на порту
+/// 5223 требует ed448 в signature_algorithms ClientHello (ring его не умеет),
+/// а при v7.1+ sessionId = TLS Finished, который rustls не отдаёт наружу.
+pub struct OpensslStream {
+    pub inner: openssl::ssl::SslStream<TcpStream>,
+}
+
+impl TlsIo for OpensslStream {
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        Read::read_exact(&mut self.inner, buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        Write::write_all(&mut self.inner, buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Write::flush(&mut self.inner)
+    }
+}
+
 /// Ошибка транспорта.
 pub type SmpResult<T> = Result<T, String>;
 
@@ -45,30 +96,21 @@ fn err<T>(msg: impl Into<String>) -> SmpResult<T> {
 }
 
 /// TLS-поток с блокирующим чтением/записью.
-fn tls_write_all(stream: &mut TlsStream, buf: &[u8]) -> SmpResult<()> {
-    let mut off = 0;
-    while off < buf.len() {
-        match stream.write(&buf[off..]) {
-            Ok(0) => return err("TLS: соединение закрыто при записи"),
-            Ok(n) => off += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("TLS write: {e}")),
-        }
-    }
+fn tls_write_all(stream: &mut dyn TlsIo, buf: &[u8]) -> SmpResult<()> {
+    stream
+        .write_all(buf)
+        .map_err(|e| format!("TLS write: {e}"))?;
     stream.flush().map_err(|e| format!("TLS flush: {e}"))
 }
 
-fn tls_read_exact(stream: &mut TlsStream, buf: &mut [u8]) -> SmpResult<()> {
-    let mut off = 0;
-    while off < buf.len() {
-        match stream.read(&mut buf[off..]) {
-            Ok(0) => return err("TLS: соединение закрыто при чтении"),
-            Ok(n) => off += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("TLS read: {e}")),
+fn tls_read_exact(stream: &mut dyn TlsIo, buf: &mut [u8]) -> SmpResult<()> {
+    stream.read_exact(buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            "TLS: соединение закрыто при чтении".to_string()
+        } else {
+            format!("TLS read: {e}")
         }
-    }
-    Ok(())
+    })
 }
 
 /// Разбирает PEM с сертификатами (без внешних зависимостей).
@@ -261,7 +303,7 @@ impl SmpAddress {
 
 /// Живая сессия SMP-сервера.
 pub struct SmpClient {
-    stream: TlsStream,
+    stream: Box<dyn TlsIo>,
     /// Согласованная версия протокола.
     pub version: u16,
     /// sessionId из server hello (tls-unique клиента).
@@ -372,7 +414,124 @@ impl SmpClient {
         };
 
         let mut client = SmpClient {
-            stream,
+            stream: Box::new(stream),
+            version: 0,
+            session_id: Vec::new(),
+            server_session_pub: None,
+            cert_der,
+            key_hash,
+            smp_ca_fingerprint: None,
+            pending: Vec::new(),
+            client_dh: StaticSecret::random_from_rng(rand::rngs::OsRng),
+            snd_chain: None,
+            rcv_chain: None,
+            session_secret: None,
+        };
+        client.smp_handshake()?;
+        Ok(client)
+    }
+
+    /// Подключение через **openssl** — для публичных релеев SimpleX (порт 5223).
+    ///
+    /// Их hs-tls требует в ClientHello TLS1.3 + CHACHA20_POLY1305 + X25519 +
+    /// **ed448** в signature_algorithms (проверено pcap-диффом: без ed448 —
+    /// alert 40). rustls/ring ed448 не поддерживает, поэтому rustls-бэкенд к
+    /// публичным релеям не подключается. Пиннинг — вручную по SHA-256
+    /// сертификатов цепочки (как в PinnedCertVerifier); реальная идентичность
+    /// сервера дополнительно сверяется по keyHash из SMP server hello.
+    pub fn connect_openssl_with_ca(host: &str, port: u16, ca_pem: Option<&str>) -> SmpResult<Self> {
+        use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+
+        let mut builder =
+            SslConnector::builder(SslMethod::tls()).map_err(|e| format!("openssl ctx: {e}"))?;
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(|e| format!("openssl min ver: {e}"))?;
+        builder
+            .set_ciphersuites("TLS_CHACHA20_POLY1305_SHA256")
+            .map_err(|e| format!("openssl ciphersuites: {e}"))?;
+        // ed448 обязателен для публичных релеев; дальше — стандартный набор.
+        builder
+            .set_sigalgs_list(
+                "ed448:ed25519:ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512",
+            )
+            .map_err(|e| format!("openssl sigalgs: {e}"))?;
+        builder
+            .set_groups_list("X25519")
+            .map_err(|e| format!("openssl groups: {e}"))?;
+        builder
+            .set_alpn_protos(b"\x05smp/1")
+            .map_err(|e| format!("openssl alpn: {e}"))?;
+        // Сертификаты проверяем вручную по отпечаткам (SimpleX CA — приватный).
+        builder.set_verify(SslVerifyMode::NONE);
+        let connector = builder.build();
+
+        let ca_fps: Option<Vec<[u8; 32]>> = match ca_pem {
+            Some(pem) => {
+                let certs = parse_pem_certs(pem)?;
+                if certs.is_empty() {
+                    return err("в PEM не найдено ни одного сертификата");
+                }
+                Some(
+                    certs
+                        .iter()
+                        .map(|der| {
+                            let fp = sha256_raw(der);
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&fp);
+                            arr
+                        })
+                        .collect(),
+                )
+            }
+            None => None,
+        };
+
+        let sock =
+            TcpStream::connect((host, port)).map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
+        sock.set_read_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| format!("read timeout: {e}"))?;
+        sock.set_write_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| format!("write timeout: {e}"))?;
+        // connect() ставит SNI = host и завершает handshake.
+        let mut stream = OpensslStream {
+            inner: connector
+                .connect(host, sock)
+                .map_err(|e| format!("TLS handshake: {e}"))?,
+        };
+
+        // Ручной пиннинг: хотя бы один сертификат цепочки должен совпасть по SHA-256.
+        let chain = stream
+            .inner
+            .ssl()
+            .peer_cert_chain()
+            .ok_or_else(|| "TLS: нет цепочки сертификатов сервера".to_string())?;
+        let ders: Vec<Vec<u8>> = chain
+            .iter()
+            .map(|c| c.to_der().map_err(|e| format!("cert der: {e}")))
+            .collect::<Result<_, _>>()?;
+        let cert_der = ders.first().cloned().unwrap_or_default();
+        if let Some(fps) = &ca_fps {
+            let ok = ders.iter().any(|der| {
+                let fp = sha256_raw(der);
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&fp);
+                fps.contains(&arr)
+            });
+            if !ok {
+                return err("TLS: отпечаток цепочки не совпадает с пинованным CA");
+            }
+        }
+        let key_hash = match &ca_fps {
+            Some(fps) => fps
+                .last()
+                .map(|a| a.to_vec())
+                .unwrap_or_else(|| sha256_raw(ders.last().unwrap_or(&cert_der))),
+            None => sha256_raw(ders.last().unwrap_or(&cert_der)),
+        };
+
+        let mut client = SmpClient {
+            stream: Box::new(stream),
             version: 0,
             session_id: Vec::new(),
             server_session_pub: None,
@@ -453,9 +612,15 @@ impl SmpClient {
         if hello.signed_object.is_empty() {
             return err("сервер не прислал сессионный ключ (v<7 или нет сертификата)");
         }
-        let (server_pub, signed_obj, signature) = extract_signed_pubkey(&hello.signed_object)
+        let (server_pub, signed_candidates, signature) = extract_signed_pubkey(&hello.signed_object)
             .ok_or_else(|| "не удалось извлечь сессионный ключ сервера".to_string())?;
-        if !verify_server_signed_key(&self.cert_der, &signed_obj, &signature) {
+        // Подписанные байты зависят от обёртки объекта у сервера:
+        // v7.0.x шлёт OCTET STRING-обёртку, публичные v7.1+ — голый SPKI SEQUENCE.
+        // Пробуем все канонические варианты (ср. `Start Sequence : ...` в Haskell).
+        if !signed_candidates
+            .iter()
+            .any(|c| verify_server_signed_key(&self.cert_der, c, &signature))
+        {
             return err("подпись сессионного ключа сервера не прошла проверку");
         }
         self.server_session_pub = Some(server_pub);

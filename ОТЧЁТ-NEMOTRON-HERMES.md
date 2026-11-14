@@ -156,15 +156,14 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 
 Полный цикл против `smp-ref` v7.0.1.0 проходит: PING → NEW/IDS → SEND → MSG (E2E payload дешифрован и совпал) → ACK → DEL (`INTEROP OK`).
 
-**Следующий шаг — публичные релеи, ИССЛЕДОВАН (2026-11-14), нужен openssl-TLS:**
-- Публичные релеи (`smp6..smp10.simplex.im`): порт **443 = CDN-fronted** (публичный сертификат, на ALPN `smp/1` — тишина, hello не приходит); реальный SMP — порт **5223** (hello приходит сразу, server hello: minVer=15 maxVer=23, sessionId 32B).
-- На 5223 rustls (ring) получает `HandshakeFailure` при любом наборе ciphers/groups. Причина, найдена pcap-диффом + openssl-bisect: сервер требует TLS1.3 + **CHACHA20_POLY1305** + **X25519** + **ed448 в signature_algorithms** (`-sigalgs` без ed448 → alert 40; с ed448 → ок). ring ed448 не умеет → rustls к публичным релеям неприменим.
-- Кроме того, у v7.1+ sessionId = TLS Finished verify_data, а rustls 0.23 Finished не expose'ит → для публичных релеев TLS-слой надо на **openssl/tokio-openssl** (тот же вывод, что в `simplex-smp-wire-protocol` для XFTP v7.1).
-- keyHash публичного релея = SHA-256 от CA (последний в цепочке): `smp6.simplex.im` → `lrzsBiZJdvN0YHeazyjFp8_oo8Cq4RqP_O4FwL3fCMY` (снято скриптом, в PEM надо класть всю цепочку — TLS-верификатор сверяет любой звено).
-- Диагностический бинарник `tls_probe` (сравнение провайдеров) оставлен в `rustcore/src/bin/`.
-- **Wire-протокол (v20) уже доказан end-to-end** против локального эталона v7.0.1.0 (полный цикл INTEROP OK); публичный прогон — следующий шаг после перевода TLS на openssl.
+**Следующий шаг — публичные релеи, ВЫПОЛНЕНО (2026-11-14): полный цикл INTEROP OK против `smp6.simplex.im:5223` (v20, PING→NEW→IDS→SEND→MSG дешифрован→ACK→DEL, 740 мс).**
+- TLS-бэкенд: добавлен `connect_openssl_with_ca` (openssl crate) поверх trait `TlsIo` — rustls оставлен для локальных серверов. Публичные релеи требуют TLS1.3 + CHACHA20_POLY1305 + X25519 + **ed448 в sigalgs** (иначе alert 40); порт 443 = CDN (тишина на smp/1), SMP — порт 5223.
+- Сертификаты публичных релеев v7.1+ — **Ed448** (не Ed25519): подпись сессионного ключа = 114 байт, верификация через openssl `Verifier::new_without_digest` (добавлен `ED448_SPKI_PREFIX` = `30 43 30 05 06 03 2b 65 71 03 3a 00` — BIT STRING 58 байт, не 66). Ed25519-путь сохранён для локальных v7.0.x.
+- Подписанные байты сессионного ключа: перебираются канонические обёртки (`extract_signed_pubkey` возвращает candidates); для публичных v7.1+ верна `SEQUENCE(SPKI-контент)` 46 Б.
+- Пиннинг CA на 5223 — цепочка с порта 5223 (`smp6-5223-chain.pem`: leaf `CN=smp6.simplex.im` + `CN=SMP server CA`), не CDN-цепочка с 443. keyHash из SMP hello = SHA-256 CA.
+- Запуск: `NEXX_TLS=openssl smp_smoke smp6.simplex.im:5223 "msg" smp6-5223-chain.pem`. Диагностика: `hello_probe`, `tls_probe`.
 
-Далее: XFTP (v3) прогон и agent-level handshake (HELLO/INV etc.) поверх SMP.
+Далее: XFTP (v3) прогон против публичного XFTP-релея и agent-level handshake (HELLO/INV etc.) поверх SMP.
 
 **Вне протокола:** APK собирается и доставляется; UI/клавиатура — по ранее зафиксированному состоянию.
 

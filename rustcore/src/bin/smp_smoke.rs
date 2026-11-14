@@ -6,6 +6,7 @@
 //! Запуск:
 //!   cargo run --release --bin smp_smoke -- smp6.simplex.im 443
 //!   cargo run --release --bin smp_smoke -- smp://<keyHash>@host:443
+//!   NEXX_TLS=openssl cargo run --release --bin smp_smoke -- smp6.simplex.im 5223 "msg" ca.pem
 
 use std::time::Instant;
 
@@ -43,7 +44,13 @@ fn main() {
                 },
                 None => None,
             };
-            match SmpClient::connect_with_ca(&a.host, a.port, ca.as_deref()) {
+            let use_openssl = std::env::var("NEXX_TLS").map(|v| v == "openssl").unwrap_or(false);
+            let connect_res = if use_openssl {
+                SmpClient::connect_openssl_with_ca(&a.host, a.port, ca.as_deref())
+            } else {
+                SmpClient::connect_with_ca(&a.host, a.port, ca.as_deref())
+            };
+            match connect_res {
                 Ok(c) => c,
                 Err(e) => {
                     println!("FAIL connect: {e}");
