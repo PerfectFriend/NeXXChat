@@ -330,14 +330,14 @@ impl SmpClient {
                     provider: provider.clone(),
                 };
                 ClientConfig::builder_with_provider(provider.clone())
-                    .with_safe_default_protocol_versions()
+                    .with_protocol_versions(&[&rustls::version::TLS13])
                     .map_err(|e| format!("rustls config: {e}"))?
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(verifier))
                     .with_no_client_auth()
             }
             None => ClientConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()
+                .with_protocol_versions(&[&rustls::version::TLS13])
                 .map_err(|e| format!("rustls config: {e}"))?
                 .with_root_certificates(roots)
                 .with_no_client_auth(),

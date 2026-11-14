@@ -156,7 +156,15 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 
 Полный цикл против `smp-ref` v7.0.1.0 проходит: PING → NEW/IDS → SEND → MSG (E2E payload дешифрован и совпал) → ACK → DEL (`INTEROP OK`).
 
-**Следующий шаг:** тот же прогон на публичных релеях (`smp6/smp8/smp10.simplex.im:443`) с закреплёнными keyHash — до сих пор публичный прогон **не верифицирован**. Далее: XFTP (v3) прогон и agent-level handshake (HELLO/INV etc.) поверх SMP.
+**Следующий шаг — публичные релеи, ИССЛЕДОВАН (2026-11-14), нужен openssl-TLS:**
+- Публичные релеи (`smp6..smp10.simplex.im`): порт **443 = CDN-fronted** (публичный сертификат, на ALPN `smp/1` — тишина, hello не приходит); реальный SMP — порт **5223** (hello приходит сразу, server hello: minVer=15 maxVer=23, sessionId 32B).
+- На 5223 rustls (ring) получает `HandshakeFailure` при любом наборе ciphers/groups. Причина, найдена pcap-диффом + openssl-bisect: сервер требует TLS1.3 + **CHACHA20_POLY1305** + **X25519** + **ed448 в signature_algorithms** (`-sigalgs` без ed448 → alert 40; с ed448 → ок). ring ed448 не умеет → rustls к публичным релеям неприменим.
+- Кроме того, у v7.1+ sessionId = TLS Finished verify_data, а rustls 0.23 Finished не expose'ит → для публичных релеев TLS-слой надо на **openssl/tokio-openssl** (тот же вывод, что в `simplex-smp-wire-protocol` для XFTP v7.1).
+- keyHash публичного релея = SHA-256 от CA (последний в цепочке): `smp6.simplex.im` → `lrzsBiZJdvN0YHeazyjFp8_oo8Cq4RqP_O4FwL3fCMY` (снято скриптом, в PEM надо класть всю цепочку — TLS-верификатор сверяет любой звено).
+- Диагностический бинарник `tls_probe` (сравнение провайдеров) оставлен в `rustcore/src/bin/`.
+- **Wire-протокол (v20) уже доказан end-to-end** против локального эталона v7.0.1.0 (полный цикл INTEROP OK); публичный прогон — следующий шаг после перевода TLS на openssl.
+
+Далее: XFTP (v3) прогон и agent-level handshake (HELLO/INV etc.) поверх SMP.
 
 **Вне протокола:** APK собирается и доставляется; UI/клавиатура — по ранее зафиксированному состоянию.
 
