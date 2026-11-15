@@ -233,7 +233,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpPoll(
             let rcv = decrypt_rcv_msg(s.srv.as_bytes(), &m.msg_id, &m.body).map_err(|e| format!("srv layer: {e}"))?;
             let (_ph, plain) = decrypt_client_msg(s.e2e.as_bytes(), &rcv.envelope).map_err(|e| format!("e2e: {e}"))?;
             let (_ph2, body) = parse_priv_header(&plain).map_err(|e| e.to_string())?;
-            let body_str = String::from_utf8_lossy(&body).to_string();
+            let body_str = String::from_utf8_lossy(body).to_string();
             if !first {
                 out.push(',');
             }
@@ -242,7 +242,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpPoll(
                 "{{\"msgId\":\"{}\",\"body\":{},\"hex\":\"{}\"}}",
                 crate::crypto::hex_encode(&m.msg_id),
                 json_str(&body_str),
-                crate::crypto::hex_encode(&body)
+                crate::crypto::hex_encode(body)
             ));
         }
         out.push_str("]}");

@@ -247,6 +247,8 @@ impl SbChainKey {
     }
 
     /// Следующий ключ+nonce цепочки: `hkdf("", ck, "SimpleXSbChain", 88)`.
+    /// (Не Iterator::next — нам нужен следующий элемент конечной цепочки ключей.)
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> ([u8; 32], [u8; 24]) {
         let out = hkdf_sha512(&[], &self.0, b"SimpleXSbChain", 88);
         self.0.copy_from_slice(&out[..32]);
@@ -761,12 +763,16 @@ pub fn parse_server_hello(block: &[u8]) -> Result<ServerHelloInfo, SmpError> {
     })
 }
 
+/// Тип: (pubkey, candidates, signature) — pubkey X25519 сервера, возможные подписанные
+/// байты (обёртка зависит от версии сервера), сама подпись.
+pub type SignedPubkeyExtraction = ([u8; 32], Vec<Vec<u8>>, Vec<u8>);
+
 /// Извлекает X25519-ключ сервера из DER подписанного объекта.
 ///
 /// Возвращает `(pubkey, candidates, signature)`, где `candidates` — возможные
 /// байты, которые сервер мог подписать (зависит от обёртки: OCTET STRING у
 /// v7.0.x, голый SPKI SEQUENCE у публичных v7.1+).
-pub fn extract_signed_pubkey(signed_der: &[u8]) -> Option<([u8; 32], Vec<Vec<u8>>, Vec<u8>)> {
+pub fn extract_signed_pubkey(signed_der: &[u8]) -> Option<SignedPubkeyExtraction> {
     // SEQUENCE { signedObject, alg+signature }
     let (_, content, _) = der_tlv(signed_der)?;
     let (obj_tag, obj_content, rest) = der_tlv(content)?;
@@ -776,9 +782,6 @@ pub fn extract_signed_pubkey(signed_der: &[u8]) -> Option<([u8; 32], Vec<Vec<u8>
     }
     let signature = find_signature(rest, 0)?;
     let pubkey = parse_x25519_x509(obj_content)?;
-    // Канонический DER первого TLV (с заголовком).
-    let full_len = signed_der.len() - content.len() + 0; // не используем; считаем напрямую ниже
-    let _ = full_len;
     let hdr_len = content.len() - obj_content.len() - rest.len();
     let full_tlv = &content[..hdr_len + obj_content.len()];
     let mut candidates = vec![

@@ -73,6 +73,19 @@ fn main() {
         None => println!("FAIL no message"),
     }
     assert_eq!(got.as_deref(), Some(text));
+
+    // Регрессия: poll на пустой очереди с коротким read timeout не должен блокироваться.
+    client.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+    let t0 = std::time::Instant::now();
+    let r = client.recv_transmissions();
+    let elapsed = t0.elapsed();
+    match r {
+        Err(e) if (e.contains("Resource temporarily unavailable") || e.contains("timed out")) && elapsed < std::time::Duration::from_secs(5) => {
+            println!("OK NONBLOCK poll: тайм-аут за {:?} (не блокируется)", elapsed);
+        }
+        other => panic!("FAIL NONBLOCK poll: {other:?} за {elapsed:?}"),
+    }
+
     client.delete_queue(&ids.rcv_id, &auth).expect("DEL");
     println!("OK DEL — CHAT UI FLOW OK");
 }

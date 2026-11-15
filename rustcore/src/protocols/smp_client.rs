@@ -74,6 +74,9 @@ impl TlsIo for Box<dyn TlsIo> {
     fn flush(&mut self) -> std::io::Result<()> {
         (**self).flush()
     }
+    fn set_read_timeout(&mut self, d: Option<Duration>) {
+        (**self).set_read_timeout(d)
+    }
 }
 
 /// TLS-поток на openssl. Нужен для публичных релеев SimpleX: их hs-tls на порту
@@ -143,12 +146,11 @@ pub fn parse_pem_certs(pem: &str) -> SmpResult<Vec<Vec<u8>>> {
 /// Разбирает цепочку сертификатов SimpleX: `count(1) * [u16 len + DER]`.
 pub fn split_cert_chain(blob: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let mut p = 0usize;
     if blob.is_empty() {
         return out;
     }
     let count = blob[0] as usize;
-    p = 1;
+    let mut p = 1usize;
     for _ in 0..count {
         if p + 2 > blob.len() {
             break;
@@ -215,9 +217,9 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
                 return Ok(rustls::client::danger::ServerCertVerified::assertion());
             }
         }
-        Err(rustls::Error::General(format!(
-            "отпечаток сертификата сервера не совпал с ожидаемым (keyHash)"
-        )))
+        Err(rustls::Error::General(
+            "отпечаток сертификата сервера не совпал с ожидаемым (keyHash)".to_string(),
+        ))
     }
 
     fn verify_tls12_signature(
@@ -310,6 +312,9 @@ impl SmpAddress {
         })
     }
 }
+
+/// Тип порции transmissions: (authenticator, corrId, entityId, command).
+pub type TransmissionItem = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// Живая сессия SMP-сервера.
 pub struct SmpClient {
@@ -504,7 +509,7 @@ impl SmpClient {
         sock.set_write_timeout(Some(Duration::from_secs(30)))
             .map_err(|e| format!("write timeout: {e}"))?;
         // connect() ставит SNI = host и завершает handshake.
-        let mut stream = OpensslStream {
+        let stream = OpensslStream {
             inner: connector
                 .connect(host, sock)
                 .map_err(|e| format!("TLS handshake: {e}"))?,
@@ -675,13 +680,14 @@ impl SmpClient {
                         // Диагностика: перебираем варианты цепочки/соли, чтобы найти расхождение.
                         let mut report = format!("decrypt block: {e}");
                         if let Some(secret) = self.session_secret {
-                            let mut cands: Vec<(String, SbChainKey)> = Vec::new();
-                            cands.push(("ck1#1".into(), SbChainKey::init(&self.session_id, &secret).0));
-                            cands.push(("ck1#2".into(), SbChainKey::init(&self.session_id, &secret).0));
-                            cands.push(("ck2#1".into(), SbChainKey::init(&self.session_id, &secret).1));
-                            cands.push(("ck2#2".into(), SbChainKey::init(&self.session_id, &secret).1));
-                            cands.push(("nosalt1#1".into(), SbChainKey::init(&[], &secret).0));
-                            cands.push(("nosalt2#1".into(), SbChainKey::init(&[], &secret).1));
+                            let cands: Vec<(String, SbChainKey)> = vec![
+                                ("ck1#1".into(), SbChainKey::init(&self.session_id, &secret).0),
+                                ("ck1#2".into(), SbChainKey::init(&self.session_id, &secret).0),
+                                ("ck2#1".into(), SbChainKey::init(&self.session_id, &secret).1),
+                                ("ck2#2".into(), SbChainKey::init(&self.session_id, &secret).1),
+                                ("nosalt1#1".into(), SbChainKey::init(&[], &secret).0),
+                                ("nosalt2#1".into(), SbChainKey::init(&[], &secret).1),
+                            ];
                             for (label, mut chain) in cands {
                                 let rounds = if label.ends_with("#2") { 2 } else { 1 };
                                 for _ in 0..rounds {
@@ -749,8 +755,8 @@ impl SmpClient {
         self.stream.set_read_timeout(d);
     }
 
-    /// Читает следующую порцию transmissions.
-    pub fn recv_transmissions(&mut self) -> SmpResult<Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>> {
+    /// Тип порции transmissions: (authenticator, corrId, entityId, command).
+    pub fn recv_transmissions(&mut self) -> SmpResult<Vec<TransmissionItem>> {
         let batch = self.read_block()?;
         let items = decode_batch(&batch).map_err(|e| format!("decode batch: {e}"))?;
         let mut out = Vec::with_capacity(items.len());
