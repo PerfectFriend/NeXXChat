@@ -40,25 +40,39 @@ pub fn mnemonic_from_entropy(entropy: &[u8]) -> Result<Vec<String>, String> {
 }
 
 /// BIP39 seed (legacy-вариант NeXX): PBKDF2-HMAC-SHA256, 2048 итераций, 64 байта.
-/// **Не совпадает со стандартом BIP39** — оставлен для обратной совместимости с
-/// уже выпущенными сборками. Для переносимых ключей используй
-/// [`seed_from_mnemonic_standard`].
-pub fn seed_from_mnemonic(mnemonic: &str, passphrase: &str) -> Vec<u8> {
+/// **Не совпадает со стандартом BIP39** — оставлен только для обратной совместимости
+/// с уже выпущенными сборками. Новые вызовы обязаны использовать
+/// [`seed_from_mnemonic`] (стандартный).
+#[deprecated(note = "legacy SHA-256 вариант; используй seed_from_mnemonic (стандарт BIP39)")]
+pub fn seed_from_mnemonic_legacy(mnemonic: &str, passphrase: &str) -> Vec<u8> {
     let salt = format!("mnemonic{passphrase}");
     pbkdf2_hmac_sha256(mnemonic.as_bytes(), salt.as_bytes(), 2048, 64)
 }
 
 /// BIP39 seed по стандарту: PBKDF2-HMAC-SHA512, salt = "mnemonic" + passphrase,
-/// 2048 итераций, 64 байта. Именно этот сид нужен для универсального источника
-/// ключей, чтобы одна и та же мнемоника давала те же ключи в любом BIP39-кошельке.
+/// 2048 итераций, 64 байта.
+///
+/// Аудит H6: единая функция (SHA-512/2048) + обязательная NFKD-нормализация
+/// мнемоники и passphrase — как требует BIP39. Раньше в проекте было две
+/// функции (SHA-256 legacy и SHA-512), из-за чего одна мнемоника давала разные
+/// сиды в зависимости от API.
+pub fn seed_from_mnemonic(mnemonic: &str, passphrase: &str) -> Vec<u8> {
+    use unicode_normalization::UnicodeNormalization;
+    let m: String = mnemonic.nfkd().collect();
+    let p: String = passphrase.nfkd().collect();
+    let salt = format!("mnemonic{p}");
+    pbkdf2_hmac_sha512(m.as_bytes(), salt.as_bytes(), 2048, 64)
+}
+
+/// Историческое имя стандартной функции (аудит H6: одна функция, legacy помечена).
 pub fn seed_from_mnemonic_standard(mnemonic: &str, passphrase: &str) -> Vec<u8> {
-    let salt = format!("mnemonic{passphrase}");
-    pbkdf2_hmac_sha512(mnemonic.as_bytes(), salt.as_bytes(), 2048, 64)
+    seed_from_mnemonic(mnemonic, passphrase)
 }
 
 /// Валидация: 12/24 слова, все из словаря, checksum сходится.
 pub fn validate_mnemonic(words: &[String]) -> bool {
-    if words.len() != 12 && words.len() != 24 {
+    // BIP39 допускает 12/15/18/21/24 слова (аудит H6).
+    if ![12usize, 15, 18, 21, 24].contains(&words.len()) {
         return false;
     }
     let wl = wordlist();

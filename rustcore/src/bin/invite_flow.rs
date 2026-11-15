@@ -12,7 +12,7 @@ use nexxrust::protocols::smp;
 use nexxrust::protocols::smp_client::SmpClient;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-const CA: &str = include_str!("/home/thomas/.hermes/cache/scratch/smp6-5223-chain.pem");
+const CA: &str = include_str!("../../assets/smp6-5223-chain.pem");
 
 /// Тело agent-сообщения «contact request»: 'C' + connReqData.
 const TAG_CONN_REQ: u8 = b'C';

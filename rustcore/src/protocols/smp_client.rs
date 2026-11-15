@@ -41,17 +41,39 @@ type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 /// серверов, openssl — для публичных релеев, см. connect_openssl_with_ca).
 pub trait TlsIo: Send {
     fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()>;
+    /// Одно неблокирующее (с текущим таймаутом) чтение «сколько пришло».
+    /// Нужно буферу частичных блоков (аудит H1): read_exact при таймауте
+    /// посередине блока теряет уже прочитанные байты.
+    fn read_some(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
     fn flush(&mut self) -> std::io::Result<()>;
     /// Тайм-аут чтения нижележащего TCP-сокета. Нужен неблокирующему poll:
     /// без него read_exact блокируется до 60 с (дефолтный тайм-аут подключения),
     /// и команды из UI ждут в очереди. По умолчанию — ничего не делает.
     fn set_read_timeout(&mut self, _d: Option<Duration>) {}
+    /// TLS Finished клиента (свой) — в модели SimpleX server hello несёт
+    /// sessionId = tlsUnique клиента (см. simplexmq Transport.hs: getFinished).
+    fn own_finished(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// TLS Finished (peer) — для channel binding с sessionId из SMP hello.
+    /// Не все бэкенды это умеют: None = проверка невозможна.
+    fn peer_finished(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl TlsIo for TlsStream {
     fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         Read::read_exact(self, buf)
+    }
+    fn peer_finished(&self) -> Option<Vec<u8>> {
+        // rustls не отдаёт TLS Finished наружу — channel binding для этого
+        // бэкенда недоступен (см. connect_pinned: требуется openssl-путь).
+        None
+    }
+    fn read_some(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Read::read(self, buf)
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         Write::write_all(self, buf)
@@ -67,6 +89,15 @@ impl TlsIo for TlsStream {
 impl TlsIo for Box<dyn TlsIo> {
     fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         (**self).read_exact(buf)
+    }
+    fn read_some(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (**self).read_some(buf)
+    }
+    fn peer_finished(&self) -> Option<Vec<u8>> {
+        (**self).peer_finished()
+    }
+    fn own_finished(&self) -> Option<Vec<u8>> {
+        (**self).own_finished()
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         (**self).write_all(buf)
@@ -89,6 +120,28 @@ pub struct OpensslStream {
 impl TlsIo for OpensslStream {
     fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         Read::read_exact(&mut self.inner, buf)
+    }
+    fn peer_finished(&self) -> Option<Vec<u8>> {
+        // TLS1.3 Finished = 32 байта (SHA-256), серверный — для channel binding.
+        let mut buf = [0u8; 64];
+        let n = self.inner.ssl().peer_finished(&mut buf);
+        if n == 0 {
+            None
+        } else {
+            Some(buf[..n].to_vec())
+        }
+    }
+    fn own_finished(&self) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 64];
+        let n = self.inner.ssl().finished(&mut buf);
+        if n == 0 {
+            None
+        } else {
+            Some(buf[..n].to_vec())
+        }
+    }
+    fn read_some(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Read::read(&mut self.inner, buf)
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         Write::write_all(&mut self.inner, buf)
@@ -166,6 +219,78 @@ pub fn split_cert_chain(blob: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Сравнение в постоянном времени (аудит C1: keyHash сравниваем без утечки
+/// по времени — иначе атакующий подбирает префикс хеша).
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// Проверка цепочки сертификатов сервера по модели SimpleX (аудит C1).
+///
+/// Требования:
+/// 1. В цепочке есть сертификат CA, чей SHA-256 (DER) == ожидаемый keyHash;
+/// 2. leaf подписан именно этим CA (настоящая проверка подписи, а не
+///    «хоть один сертификат совпал»);
+/// 3. никакого CN-fallback: имя хоста в модели SimpleX не является
+///    идентификатором сервера.
+pub fn validate_server_chain(
+    leaf_der: &[u8],
+    chain_ders: &[Vec<u8>],
+    expected_key_hash: &[u8],
+) -> SmpResult<()> {
+    use openssl::stack::Stack;
+    use openssl::x509::store::X509StoreBuilder;
+    use openssl::x509::{X509, X509StoreContext};
+
+    if expected_key_hash.len() != 32 {
+        return err("keyHash должен быть 32 байтами (SHA-256)");
+    }
+    // 1. Ищем CA по хешу — строгое совпадение, any-match запрещён.
+    let mut ca_der: Option<Vec<u8>> = None;
+    for der in chain_ders {
+        if ct_eq(&sha256_raw(der), expected_key_hash) {
+            ca_der = Some(der.clone());
+            break;
+        }
+    }
+    let ca_der = ca_der.ok_or_else(|| {
+        "TLS: в цепочке нет CA с ожидаемым keyHash (сервер не закреплён)".to_string()
+    })?;
+
+    // 2. Настоящая проверка подписи: leaf <- CA.
+    let ca = X509::from_der(&ca_der).map_err(|e| format!("CA cert: {e}"))?;
+    let leaf = X509::from_der(leaf_der).map_err(|e| format!("leaf cert: {e}"))?;
+    let mut builder = X509StoreBuilder::new().map_err(|e| format!("X509 store: {e}"))?;
+    builder
+        .add_cert(ca)
+        .map_err(|e| format!("X509 add CA: {e}"))?;
+    let store = builder.build();
+    let mut untrusted = Stack::new().map_err(|e| format!("X509 stack: {e}"))?;
+    for der in chain_ders {
+        if ct_eq(&sha256_raw(der), expected_key_hash) {
+            continue;
+        }
+        if let Ok(c) = X509::from_der(der) {
+            let _ = untrusted.push(c);
+        }
+    }
+    let mut ctx = X509StoreContext::new().map_err(|e| format!("X509 ctx: {e}"))?;
+    let ok = ctx
+        .init(&store, &leaf, &untrusted, |c| c.verify_cert())
+        .map_err(|e| format!("X509 verify: {e}"))?;
+    if !ok {
+        return err("TLS: цепочка сертификатов не подтверждена закреплённым CA");
+    }
+    Ok(())
+}
+
 /// Верификатор сертификата сервера в режиме **пиннинга отпечатка**.
 ///
 /// Сертификаты SimpleX (CA `CN=SMP server CA, O=SimpleX`) выпускаются **без SAN** —
@@ -176,10 +301,8 @@ pub fn split_cert_chain(blob: &[u8]) -> Vec<Vec<u8>> {
 /// 2) иначе — принимается сертификат, чей CN совпадает с ожидаемым хостом.
 #[derive(Debug)]
 struct PinnedCertVerifier {
-    /// Ожидаемые SHA-256 отпечатки сертификатов (CA).
-    expected_fps: Vec<[u8; 32]>,
-    /// Ожидаемый CN (если пиннинг по отпечатку не сработал).
-    expected_cn: Option<String>,
+    /// Ожидаемый SHA-256 отпечаток CA-сертификата (= keyHash из адреса).
+    expected_key_hash: [u8; 32],
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
@@ -192,34 +315,14 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let mut chain: Vec<&[u8]> = vec![end_entity.as_ref()];
-        for i in intermediates {
-            chain.push(i.as_ref());
-        }
-        for der in &chain {
-            let fp = sha256_raw(der);
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&fp);
-            if self.expected_fps.contains(&arr) {
-                return Ok(rustls::client::danger::ServerCertVerified::assertion());
-            }
-        }
-        // Запасной путь: CN сертификата == ожидаемый хост (SimpleX-сертификаты без SAN).
-        if let Some(cn) = &self.expected_cn {
-            for der in &chain {
-                if let Ok(certs) = parse_pem_certs(&der_to_pem(der)) {
-                    for c in certs {
-                        let _ = c;
-                    }
-                }
-            }
-            if cert_cn_matches(end_entity.as_ref(), cn) {
-                return Ok(rustls::client::danger::ServerCertVerified::assertion());
-            }
-        }
-        Err(rustls::Error::General(
-            "отпечаток сертификата сервера не совпал с ожидаемым (keyHash)".to_string(),
-        ))
+        // Аудит C1: никакого CN-fallback и «хоть один сертификат совпал».
+        // Требование: в цепочке есть CA с ожидаемым keyHash, и leaf подписан им.
+        let chain: Vec<Vec<u8>> = std::iter::once(end_entity.as_ref().to_vec())
+            .chain(intermediates.iter().map(|i| i.as_ref().to_vec()))
+            .collect();
+        validate_server_chain(end_entity.as_ref(), &chain, &self.expected_key_hash)
+            .map_err(|e| rustls::Error::General(e))?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -257,18 +360,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-/// Достаёт CN из DER-сертификата (минимальный разбор X.509).
-fn cert_cn_matches(der: &[u8], cn: &str) -> bool {
-    // Ищем ASCII-строку CN в printable-части сертификата.
-    let text: String = der.iter().filter(|b| (32..127).contains(*b)).map(|b| *b as char).collect();
-    text.contains(&format!("CN={cn}")) || text.contains(&format!("CN = {cn}"))
-}
 
-/// Оборачивает DER в PEM (для совместимости с парсером).
-fn der_to_pem(der: &[u8]) -> String {
-    let b64 = crate::crypto::base64url_encode(der);
-    format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n")
-}
 
 /// Адрес SMP-сервера.
 #[derive(Debug, Clone)]
@@ -319,6 +411,12 @@ pub type TransmissionItem = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 /// Живая сессия SMP-сервера.
 pub struct SmpClient {
     stream: Box<dyn TlsIo>,
+    /// Буфер накопления частично принятого блока (аудит H1): таймаут чтения
+    /// посередине блока не должен терять уже принятые байты — следующий вызов
+    /// read_block дочитает остаток с того же места.
+    read_buf: Vec<u8>,
+    /// Тайм-аут poll (неблокирующее чтение). Команды ждут дольше — см. wait_response.
+    poll_timeout: Duration,
     /// Согласованная версия протокола.
     pub version: u16,
     /// sessionId из server hello (tls-unique клиента).
@@ -329,6 +427,8 @@ pub struct SmpClient {
     pub cert_der: Vec<u8>,
     /// SHA-256 от leaf-сертификата.
     pub key_hash: Vec<u8>,
+    /// Ожидаемый (закреплённый) keyHash CA — если задан, проверяется строго.
+    pub expected_key_hash: Option<Vec<u8>>,
     /// Отпечаток CA-сертификата сервера из SMP-цепочки (настоящий keyHash SimpleX).
     pub smp_ca_fingerprint: Option<Vec<u8>>,
     /// Сообщения, пришедшие не по запросу (уведомления очереди).
@@ -352,38 +452,29 @@ impl SmpClient {
     /// `ca_pem` — PEM с CA-сертификатом сервера; если None — системные/public CA.
     pub fn connect_with_ca(host: &str, port: u16, ca_pem: Option<&str>) -> SmpResult<Self> {
         let mut roots = RootCertStore::empty();
-        let mut pinned_ca: Option<Vec<u8>> = None;
-        let mut ca_fps: Option<Vec<[u8; 32]>> = None;
-        match ca_pem {
-            Some(pem) => {
-                let certs = parse_pem_certs(pem)?;
-                if certs.is_empty() {
-                    return err("в PEM не найдено ни одного сертификата");
-                }
-                let mut fps = Vec::with_capacity(certs.len());
-                for der in &certs {
-                    roots
-                        .add(rustls::pki_types::CertificateDer::from(der.clone()))
-                        .map_err(|e| format!("CA не принят: {e}"))?;
-                    let fp = sha256_raw(der);
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&fp);
-                    fps.push(arr);
-                }
-                pinned_ca = certs.last().cloned();
-                ca_fps = Some(fps);
-            }
-            None => {
-                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            }
+        // Аудит C1: CA обязателен — без закреплённого CA сервер не идентифицирован.
+        let ca_pem = ca_pem.ok_or_else(|| {
+            "TLS: CA обязателен (модель SimpleX: сервер идентифицируется keyHash CA)".to_string()
+        })?;
+        let certs = parse_pem_certs(ca_pem)?;
+        if certs.is_empty() {
+            return err("в PEM не найдено ни одного сертификата");
         }
+        for der in &certs {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der.clone()))
+                .map_err(|e| format!("CA не принят: {e}"))?;
+        }
+        let pinned_ca: Vec<u8> = certs.last().cloned().unwrap_or_default();
+        let mut ca_fp = [0u8; 32];
+        ca_fp.copy_from_slice(&sha256_raw(&pinned_ca));
+        let ca_fps: Option<Vec<[u8; 32]>> = Some(vec![ca_fp]);
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = match &ca_fps {
             Some(fps) => {
                 // Пиннинг по отпечатку CA: сертификаты SimpleX идут без SAN.
                 let verifier = PinnedCertVerifier {
-                    expected_fps: fps.clone(),
-                    expected_cn: Some(host.to_string()),
+                    expected_key_hash: fps[0],
                     provider: provider.clone(),
                 };
                 ClientConfig::builder_with_provider(provider.clone())
@@ -421,20 +512,22 @@ impl SmpClient {
             .peer_certificates()
             .ok_or_else(|| "TLS: нет сертификата сервера".to_string())?;
         let cert_der = certs[0].as_ref().to_vec();
-        // Отпечаток (keyHash) — это отпечаток CA-сертификата сервера:
-        // последний в цепочке, либо сам leaf (когда сертификат самоподписанный).
-        let key_hash = match pinned_ca {
-            Some(ca) => sha256_raw(&ca),
-            None => sha256_raw(certs.last().map(|c| c.as_ref()).unwrap_or(&cert_der)),
-        };
+        // Отпечаток (keyHash) — это отпечаток CA-сертификата сервера.
+        let key_hash = sha256_raw(pinned_ca.as_slice());
+        // Аудит C1: настоящая проверка цепочки (leaf подписан закреплённым CA).
+        let chain_ders: Vec<Vec<u8>> = certs.iter().map(|c| c.as_ref().to_vec()).collect();
+        validate_server_chain(&cert_der, &chain_ders, &ca_fp)?;
 
         let mut client = SmpClient {
             stream: Box::new(stream),
+            read_buf: Vec::new(),
+            poll_timeout: Duration::from_millis(300),
             version: 0,
             session_id: Vec::new(),
             server_session_pub: None,
             cert_der,
             key_hash,
+            expected_key_hash: None,
             smp_ca_fingerprint: None,
             pending: Vec::new(),
             client_dh: StaticSecret::random_from_rng(rand::rngs::OsRng),
@@ -477,29 +570,26 @@ impl SmpClient {
         builder
             .set_alpn_protos(b"\x05smp/1")
             .map_err(|e| format!("openssl alpn: {e}"))?;
-        // Сертификаты проверяем вручную по отпечаткам (SimpleX CA — приватный).
+        // TLS-проверку цепочки делаем сами (SimpleX CA — приватный, не в системных
+        // корнях), но по-настоящему: leaf должен быть подписан закреплённым CA,
+        // а не «хоть один сертификат совпал» (аудит C1).
         builder.set_verify(SslVerifyMode::NONE);
         let connector = builder.build();
 
-        let ca_fps: Option<Vec<[u8; 32]>> = match ca_pem {
-            Some(pem) => {
-                let certs = parse_pem_certs(pem)?;
-                if certs.is_empty() {
-                    return err("в PEM не найдено ни одного сертификата");
-                }
-                Some(
-                    certs
-                        .iter()
-                        .map(|der| {
-                            let fp = sha256_raw(der);
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&fp);
-                            arr
-                        })
-                        .collect(),
-                )
-            }
-            None => None,
+        // CA обязателен: без него сервер не идентифицирован.
+        let ca_pem = ca_pem.ok_or_else(|| {
+            "TLS: CA обязателен (модель SimpleX: сервер идентифицируется keyHash CA)".to_string()
+        })?;
+        let pem_certs = parse_pem_certs(ca_pem)?;
+        if pem_certs.is_empty() {
+            return err("в PEM не найдено ни одного сертификата");
+        }
+        let ca_der: Vec<u8> = pem_certs.last().cloned().unwrap_or_default();
+        let expected_key_hash: [u8; 32] = {
+            let fp = sha256_raw(&ca_der);
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&fp);
+            arr
         };
 
         let sock =
@@ -515,7 +605,7 @@ impl SmpClient {
                 .map_err(|e| format!("TLS handshake: {e}"))?,
         };
 
-        // Ручной пиннинг: хотя бы один сертификат цепочки должен совпасть по SHA-256.
+        // Аудит C1: настоящая проверка цепочки — CA с ожидаемым keyHash + подпись leaf.
         let chain = stream
             .inner
             .ssl()
@@ -526,32 +616,20 @@ impl SmpClient {
             .map(|c| c.to_der().map_err(|e| format!("cert der: {e}")))
             .collect::<Result<_, _>>()?;
         let cert_der = ders.first().cloned().unwrap_or_default();
-        if let Some(fps) = &ca_fps {
-            let ok = ders.iter().any(|der| {
-                let fp = sha256_raw(der);
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&fp);
-                fps.contains(&arr)
-            });
-            if !ok {
-                return err("TLS: отпечаток цепочки не совпадает с пинованным CA");
-            }
-        }
-        let key_hash = match &ca_fps {
-            Some(fps) => fps
-                .last()
-                .map(|a| a.to_vec())
-                .unwrap_or_else(|| sha256_raw(ders.last().unwrap_or(&cert_der))),
-            None => sha256_raw(ders.last().unwrap_or(&cert_der)),
-        };
+        validate_server_chain(&cert_der, &ders, &expected_key_hash)?;
+        // keyHash = отпечаток закреплённого CA (а не «последний в цепочке»).
+        let key_hash = expected_key_hash.to_vec();
 
         let mut client = SmpClient {
             stream: Box::new(stream),
+            read_buf: Vec::new(),
+            poll_timeout: Duration::from_millis(300),
             version: 0,
             session_id: Vec::new(),
             server_session_pub: None,
             cert_der,
             key_hash,
+            expected_key_hash: Some(expected_key_hash.to_vec()),
             smp_ca_fingerprint: None,
             pending: Vec::new(),
             client_dh: StaticSecret::random_from_rng(rand::rngs::OsRng),
@@ -608,6 +686,34 @@ impl SmpClient {
         let ca_fp = sha256_raw(ca_der);
         self.smp_ca_fingerprint = Some(ca_fp.clone());
         self.key_hash = ca_fp.clone();
+
+        // 2a. Аудит C1: SMP-hello chain и TLS chain — один и тот же сервер.
+        //     leaf из SMP hello должен быть тем же сертификатом, которым
+        //     проверялась подпись сессионного ключа (self.cert_der = TLS leaf),
+        //     а CA SMP-цепочки — тем же CA, что закреплён по keyHash.
+        if !certs.is_empty() && !ct_eq(&certs[0], &self.cert_der) {
+            return err("SMP hello: leaf сертификата не совпадает с TLS-сертификатом".to_string());
+        }
+        if let Some(expected) = &self.expected_key_hash {
+            if !ct_eq(&ca_fp, expected) {
+                return err(format!(
+                    "keyHash сервера не совпадает с закреплённым: ожидался {}, получен {}",
+                    crate::crypto::hex_encode(expected),
+                    crate::crypto::hex_encode(&ca_fp)
+                ));
+            }
+        }
+
+        // 2b. Аудит C1: channel binding. В модели SimpleX sessionId из server
+        //     hello = tlsUnique клиента = его собственный TLS Finished
+        //     (simplexmq Transport.hs: getFinished для клиента).
+        //     Это связывает TLS-канал и SMP-сессию: MITM не может подменить
+        //     server hello, не имея Finished этого канала.
+        if let Some(own) = self.stream.own_finished() {
+            if !ct_eq(&own, &self.session_id) {
+                return err("channel binding: sessionId не совпадает с TLS Finished".to_string());
+            }
+        }
 
         // 3. Клиентский handshake.
         let client_pub = X25519Public::from(&self.client_dh);
@@ -669,58 +775,25 @@ impl SmpClient {
 
     /// Читает блок (с расшифровкой, если версия >= 11).
     fn read_block(&mut self) -> SmpResult<Vec<u8>> {
-        let mut block = vec![0u8; BLOCK_SIZE];
-        tls_read_exact(&mut self.stream, &mut block)?;
+        // Аудит H1: накапливаем блок в read_buf. При таймауте посередине блока
+        // уже принятые байты остаются в буфере, а не теряются — поток не сбивается.
+        while self.read_buf.len() < BLOCK_SIZE {
+            let mut tmp = [0u8; BLOCK_SIZE];
+            match self.stream.read_some(&mut tmp) {
+                Ok(0) => return err("TLS: соединение закрыто при чтении".to_string()),
+                Ok(n) => self.read_buf.extend_from_slice(&tmp[..n]),
+                Err(e) => return Err(format!("TLS read: {e}")), // WouldBlock/timeout: буфер сохранён
+            }
+        }
+        let block: Vec<u8> = self.read_buf.drain(..BLOCK_SIZE).collect();
         match self.rcv_chain.as_mut() {
             Some(chain) => {
                 let (sk, nonce) = chain.next();
                 let plain = match crypto_box_decrypt(&sk, &nonce, &block) {
                     Ok(p) => p,
-                    Err(e) => {
-                        // Диагностика: перебираем варианты цепочки/соли, чтобы найти расхождение.
-                        let mut report = format!("decrypt block: {e}");
-                        if let Some(secret) = self.session_secret {
-                            let cands: Vec<(String, SbChainKey)> = vec![
-                                ("ck1#1".into(), SbChainKey::init(&self.session_id, &secret).0),
-                                ("ck1#2".into(), SbChainKey::init(&self.session_id, &secret).0),
-                                ("ck2#1".into(), SbChainKey::init(&self.session_id, &secret).1),
-                                ("ck2#2".into(), SbChainKey::init(&self.session_id, &secret).1),
-                                ("nosalt1#1".into(), SbChainKey::init(&[], &secret).0),
-                                ("nosalt2#1".into(), SbChainKey::init(&[], &secret).1),
-                            ];
-                            for (label, mut chain) in cands {
-                                let rounds = if label.ends_with("#2") { 2 } else { 1 };
-                                for _ in 0..rounds {
-                                    let (sk, nonce) = chain.next();
-                                    if crypto_box_decrypt(&sk, &nonce, &block).is_ok() {
-                                        report.push_str(&format!("; WORKS={label}"));
-                                        break;
-                                    }
-                                }
-                            }
-                            {
-                                let (sk1, n1) = SbChainKey::init(&self.session_id, &secret).0.next();
-                                let (sk2, n2) = SbChainKey::init(&self.session_id, &secret).1.next();
-                                report.push_str(&format!(
-                                    "; ck1.next sk={} nonce={}; ck2.next sk={} nonce={}",
-                                    crate::crypto::hex_encode(&sk1),
-                                    crate::crypto::hex_encode(&n1),
-                                    crate::crypto::hex_encode(&sk2),
-                                    crate::crypto::hex_encode(&n2)
-                                ));
-                            }
-                            report.push_str(&format!(
-                                "; block[0..64]={}",
-                                crate::crypto::hex_encode(&block[..64])
-                            ));
-                            report.push_str(&format!(
-                                "; sessId={} secret={}",
-                                crate::crypto::hex_encode(&self.session_id),
-                                crate::crypto::hex_encode(&secret)
-                            ));
-                        }
-                        return err(report);
-                    }
+                    // ВАЖНО (аудит C2): в текст ошибки НЕ включаются session secret,
+                    // session_id, ключи цепочек и содержимое блока — только факт сбоя.
+                    Err(_) => return err("decrypt block failed".to_string()),
                 };
                 unpad(&plain).map_err(|e| format!("unpad block: {e}"))
             }
@@ -755,6 +828,41 @@ impl SmpClient {
         self.stream.set_read_timeout(d);
     }
 
+    /// Задаёт ожидаемый (закреплённый) keyHash сервера и сразу сверяет его
+    /// с отпечатком CA, полученным в SMP hello (аудит C1).
+    pub fn set_expected_key_hash(&mut self, expected: Vec<u8>) -> SmpResult<()> {
+        if expected.len() != 32 {
+            return err("keyHash должен быть 32 байтами (SHA-256)");
+        }
+        if let Some(got) = &self.smp_ca_fingerprint {
+            if !ct_eq(got, &expected) {
+                return err(format!(
+                    "keyHash сервера не совпадает с закреплённым: ожидался {}, получен {}",
+                    crate::crypto::hex_encode(&expected),
+                    crate::crypto::hex_encode(got)
+                ));
+            }
+        }
+        self.expected_key_hash = Some(expected);
+        Ok(())
+    }
+
+    /// TLS Finished сервера.
+    pub fn tls_peer_finished(&self) -> Option<Vec<u8>> {
+        self.stream.peer_finished()
+    }
+
+    /// TLS Finished клиента (свой) — channel binding с sessionId из server hello.
+    pub fn tls_own_finished(&self) -> Option<Vec<u8>> {
+        self.stream.own_finished()
+    }
+
+    /// Устанавливает тайм-аут неблокирующего poll (по умолчанию 300 мс).
+    pub fn set_poll_timeout(&mut self, d: Duration) {
+        self.poll_timeout = d;
+        self.stream.set_read_timeout(Some(d));
+    }
+
     /// Тип порции transmissions: (authenticator, corrId, entityId, command).
     pub fn recv_transmissions(&mut self) -> SmpResult<Vec<TransmissionItem>> {
         let batch = self.read_block()?;
@@ -774,6 +882,15 @@ impl SmpClient {
 
     /// Ждёт ответа на конкретную команду (по corrId).
     pub fn wait_response(&mut self, corr_id: &[u8]) -> SmpResult<ServerResponse> {
+        // Аудит H1: таймаут команды (10 с) отделён от таймаута poll —
+        // джиттер сети не должен ронять SEND/ACK/NEW ложным таймаутом.
+        self.set_read_timeout(Some(Duration::from_secs(10)));
+        let r = self.wait_response_inner(corr_id);
+        self.set_read_timeout(Some(self.poll_timeout));
+        r
+    }
+
+    fn wait_response_inner(&mut self, corr_id: &[u8]) -> SmpResult<ServerResponse> {
         for _ in 0..64 {
             let items = self.recv_transmissions()?;
             for (auth, corr, entity, cmd) in items {

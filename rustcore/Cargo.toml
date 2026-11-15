@@ -15,6 +15,10 @@ hmac = "0.12"
 pbkdf2 = { version = "0.12", features = ["hmac"] }
 base64 = "0.22"
 serde_json = "1"
+# NFKD-нормализация для BIP39 (стандарт требует NFKD мнемоники и passphrase).
+unicode-normalization = "0.1"
+# zeroize: стирание приватных ключей/сида из памяти (аудит H7).
+zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 libc = "0.2"
 k256 = { version = "0.13", features = ["arithmetic"] }

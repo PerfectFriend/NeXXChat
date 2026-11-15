@@ -1,0 +1,8 @@
+# Пути сборки не должны попадать в релизный артефакт (аудит M5/приёмка:
+# `strings release .so | grep /home/thomas` → пусто).
+# Переносим префиксы cargo-реестра и рабочих каталогов в нейтральные.
+[build]
+rustflags = [
+  "--remap-path-prefix=/home/thomas/build/rust/cargo/registry=registry",
+  "--remap-path-prefix=/home/thomas=local",
+]

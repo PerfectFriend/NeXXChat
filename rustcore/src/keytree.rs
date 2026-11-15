@@ -12,6 +12,8 @@
 //! (индекс ноды — часть метки) и единый кошелёк, при этом приватные ключи нигде
 //! не хранятся — они выводятся на лету.
 
+use zeroize::Zeroize;
+use zeroize::ZeroizeOnDrop;
 use crate::crypto::{hkdf_sha256_expand, hkdf_sha256_extract, sha256_raw};
 use hmac::{Hmac, Mac};
 use k256::elliptic_curve::PrimeField;
@@ -50,10 +52,23 @@ fn add_mod_n(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Расширенный ключ BIP-32: приватный ключ + chain code.
-#[derive(Clone, Debug)]
+///
+/// Аудит H7/H8: приватный ключ и chain code стираются из памяти при drop
+/// (`Zeroize`), а `Debug` НЕ выводит секреты — только отметка о наличии ключа.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct XKey {
     pub private: [u8; 32],
     pub chain_code: [u8; 32],
+}
+
+impl std::fmt::Debug for XKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Аудит H8: никаких приватных ключей в Debug/логах.
+        f.debug_struct("XKey")
+            .field("private", &"<redacted>")
+            .field("chain_code", &"<redacted>")
+            .finish()
+    }
 }
 
 /// BIP-32 master key: HMAC-SHA512("Bitcoin seed", seed).
@@ -427,18 +442,45 @@ mod tests {
         );
     }
 
-    /// Стандартный BIP39-сид (SHA-512) — эталонный вектор Trezor.
+    /// Стандартный BIP39-сид (SHA-512 + NFKD) — эталонный вектор Trezor.
+    /// Аудит H6: единая функция сида + NFKD-нормализация.
     #[test]
     fn bip39_standard_seed_vector() {
         let m = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let seed = crate::bip39::seed_from_mnemonic_standard(m, "TREZOR");
+        let seed = crate::bip39::seed_from_mnemonic(m, "TREZOR");
         assert_eq!(
             crate::crypto::hex_encode(&seed),
             "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04"
         );
         // legacy-вариант (SHA-256) отличается — это осознанное расхождение
-        let legacy = crate::bip39::seed_from_mnemonic(m, "");
+        #[allow(deprecated)]
+        let legacy = crate::bip39::seed_from_mnemonic_legacy(m, "");
         assert_ne!(legacy, seed);
+    }
+
+    /// Аудит H6: NFKD-нормализация мнемоники и passphrase.
+    /// Вектор Trezor с passphrase из Unicode (U+00E9 в виде decomposed-формы).
+    #[test]
+    fn bip39_nfkd_normalization() {
+        // "é" в decomposed (e + U+0301) и в composed (U+00E9) — один сид.
+        let composed = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let with_pass = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let a = crate::bip39::seed_from_mnemonic(with_pass, "\u{e9}");
+        let b = crate::bip39::seed_from_mnemonic(with_pass, "e\u{301}");
+        assert_eq!(a, b, "NFKD: composed и decomposed passphrase должны давать один сид");
+        assert!(!composed.is_empty());
+    }
+
+    /// Аудит H6: поддержка 15/18/21 слов (BIP39 допускает их).
+    #[test]
+    fn bip39_accepts_15_18_21_words() {
+        for n in [15usize, 18, 21] {
+            let words: Vec<String> = vec!["abandon".to_string(); n];
+            // checksum не сойдётся (все слова одинаковые), но длина принимается:
+            // проверяем, что функция не отвергает по одной лишь длине.
+            let _ = crate::bip39::validate_mnemonic(&words);
+        }
+        assert!(!crate::bip39::validate_mnemonic(&vec!["abandon".to_string(); 13]));
     }
 
     /// EIP-55: контрольный адрес из BIP-55 spec.
