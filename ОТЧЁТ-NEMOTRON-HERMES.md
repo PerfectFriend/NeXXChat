@@ -39,7 +39,14 @@
   `objRaw = encodeASN1' DER (Start Sequence : toASN1 object …)`, т.е. **SPKI с дополнительной SEQUENCE-обёрткой (46 байт вместо 44)**.
   Проверено независимо: `openssl pkeyutl -verify … -rawin` и Python `cryptography` — подпись сходится **только** по 46-байтовому сообщению.
   → Наш клиент теперь это учитывает (`der_wrap_sequence`), и **Ed25519-проверка подписи сервера проходит**.
-* Идентификация сервера: `keyHash` = SHA-256 отпечатка **CA-сертификата** из цепочки (SimpleX-адрес `smp://<fp>@host:port`); сертификаты SimpleX выпускаются без SAN, поэтому проверка идёт по отпечатку CA (`PinnedCertVerifier`), а не по имени хоста.
+* Идентификация сервера: `keyHash` = SHA-256 отпечатка **CA-сертификата** из цепочки (SimpleX-адрес `smp://<fp>@host:port`); сертификаты SimpleX выпускаются без SAN, поэтому проверка идёт по отпечатку CA, а не по имени хоста.
+* **Аутентификация сервера переработана по итогам внешнего аудита (C1, закрыто):**
+  * `keyHash` **обязателен** в API (`smpConnect(host, port, caPem, keyHashHex, …)`); пустой CA PEM или keyHash → ошибка, а не «пропустить проверку»;
+  * настоящая проверка цепочки: CA ищется по **строгому** совпадению SHA-256(DER), leaf проверяется через `X509Store`/`X509StoreContext` (проверка подписи), сравнение constant-time (`ct_eq`);
+  * **удалены**: `set_verify(SslVerifyMode::NONE)` на боевом пути, any-match по отпечаткам цепочки, CN-fallback для самоподписанного leaf;
+  * цепочка из SMP-hello обязана совпадать с TLS-цепочкой, а её CA-fingerprint — с закреплённым keyHash;
+  * **channel binding**: `session_id` из server hello обязан совпасть с **собственным** TLS Finished клиента (`ssl.finished()`, не `peer_finished()`) — проверено побайтово против `smp6.simplex.im:5223`;
+  * негативные тесты: `rustcore/tests/audit_c1_pinning.rs` — 6 reject-сценариев + тест constant-time.
 
 ### 3.2 Шифрование блоков (v ≥ 11; у нас v20 — значит включено)
 
@@ -128,19 +135,33 @@ cd ~/Projects/NeXX && ./gradlew :app:assembleDebug      # → NeXX-rust-debug.ap
 
 ## 8. APK и доставка
 
-* `~/apkexport/NeXX-rust-debug.apk` — ~24 МБ, три ABI внутри (проверено `unzip -l`).
+* `~/apkexport/NeXX-allabi-debug.apk` — **59 111 214 байт**, три ABI внутри (проверено `unzip -l`): arm64-v8a (15 142 332 Б), armeabi-v7a (10 668 096 Б), x86_64 (16 901 260 Б).
 * Имя по правилу владельца: `<Проект>-<abi>-debug.apk`.
-* Доставка в Telegram-топик `-1004431090317:23616`: Bot API режет 50 МБ → для крупных файлов MTProto (`~/Projects/TGSend/tg_send_file.py`, venv `~/.hermes/installs/tg-mtproto`, `api_id/api_hash/phone` в `~/.hermes/secrets/tg_mtproto.env` — значения не хранятся вне секретов).
+* Доставка в Telegram-топик `-1004431090317:23616`: Bot API режет 50 МБ → для крупных файлов MTProto (`~/Projects/TGSend/tg_send_file.py`, venv `~/.hermes/installs/tg-mtproto/venv`, `api_id/api_hash/phone` в `~/.hermes/secrets/tg_mtproto.env` — значения не хранятся вне секретов).
+* Последняя доставка: **`id=31691`**, `size=59111214`, `chat=-1004431090317`, `topic=23616` (MTProto, подтверждено выводом отправщика).
+* **Проверка содержимого APK (приёмка аудита):** в `.so` внутри APK — `secret=`/`sessId=`/`WORKS=` → **0 совпадений**; `/home/thomas` → **0 совпадений** (пути вычищены: `--remap-path-prefix` + пост-обработка в `app-rust/build-android.sh`).
+* Манифест: `allowBackup=false`, `fullBackupContent=false`, `dataExtractionRules` (бэкап исключён), `usesCleartextTraffic=false` — проверено `aapt2 dump xmltree` по собранному APK.
 
 ## 9. Тесты и верификация (фактический вывод)
 
 ```
-$ cargo test --release
-test result: ok. 68 passed; 0 failed   (вкл. KAT crypto_box и serviceSig layout)
+$ cargo test --release --lib
+test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo test --release --test audit_c1_pinning
+(7 негативных тестов C1 — все PASS)
+
+$ strings target/release/libnexxrust.so | grep -cE "secret=|sessId=|WORKS="
+0
+$ strings target/release/libnexxrust.so | grep -c "/home/thomas"
+0
 ```
 
 Живой прогон против `smp-ref` (v7.0.1.0, 127.0.0.1:443): полный цикл
 PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпал) → ACK/OK → DEL/OK — `INTEROP OK in 86 ms`.
+
+Живые прогоны против публичной сети SimpleX — `bash rustcore/scripts/interop-all.sh smp6.simplex.im:5223`: **5/5 PASS**
+(chat_flow, agent_smoke, agent_rotate, smp_cmds, invite_flow), плюс XFTP v4 roundtrip на `xftp1.simplex.im:443`.
 
 Дополнительно подтверждено:
 * fingerprint сервера из его лога (`BrZx1e…nK4=`) **==** наш keyHash (SHA-256 от CA-сертификата) → identity-часть handshake принимается сервером;
@@ -149,6 +170,39 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 * публичные релеи (`smp6/smp8/smp10.simplex.im:443`) — прогон запускался, но **результат не верифицирован** (лог не подтверждён), поэтому в статус «совместимость с публичной сетью» не засчитан.
 
 ## 10. Блокеры и следующие шаги
+
+### 10.1 Спринт аудита 2–3 — что закрыто (2026-11-15, вечер)
+
+Внешние аудиторы (Claude + Grok) нашли C1 (MITM на аутентификации сервера), C2 (секреты в тексте ошибки), H1–H8 и M1–M11. Закрыто с приёмочными доказательствами:
+
+| ID | Статус | Доказательство |
+|---|---|---|
+| C1 | ✅ закрыто | `validate_server_chain` + constant-time + 7 негативных тестов (`audit_c1_pinning.rs`) |
+| C2 | ✅ закрыто | `strings .so` → 0 совпадений `secret=`/`sessId=`/`WORKS=` (и в `.so`, и в APK) |
+| H1 (буфер чтения) | ✅ закрыто | `read_buf` + раздельные таймауты (poll 300 мс / команды 10 с) |
+| H2 (глобальный мьютекс) | ✅ закрыто | `SESSIONS` = `HashMap<i64, Arc<Mutex<Session>>>` |
+| H3 (паники FFI) | ✅ закрыто | `ffi_guard!` (`catch_unwind`) на всех JNI-экспортах, `hosts.get(0).ok_or` |
+| H4 (damaged ACK) | ✅ закрыто | poll не рвётся на битом сообщении: ACK + счётчик `damaged` |
+| H5 (ключи очередей) | ✅ закрыто | `protocols/queue_store.rs`: уникальный индекс `m/0'/0'/{i}'` + `m/0'/1'/{i}'`, шифрование AES-256-GCM, `DEL` при закрытии |
+| H6 (BIP39) | ⚠️ частично | единая `seed_from_mnemonic` (SHA-512/2048) + NFKD, 15/18/21 слов; **осталось:** убрать произвольные KDF-параметры из JNI |
+| H7 (сид через JNI) | ⚠️ частично | `Zeroize`/`ZeroizeOnDrop` есть; **осталось:** opaque-handle API вместо `seedHex` в сигнатурах |
+| H8 (Debug/логи) | ✅ закрыто | `XKey: Debug` → `<redacted>` |
+| M1 (JSON) | ✅ закрыто | `serde_json` вместо ручной экранировки |
+| M2 (connect) | ✅ закрыто | `connect_timeout` 15 с |
+| M4 (манифест) | ⚠️ частично | `allowBackup=false`, `dataExtractionRules`, `usesCleartextTraffic=false`; **осталось:** `FLAG_SECURE`, secure-input поля сида в egui |
+| M5 (пути/сборка) | ⚠️ частично | `strings .so` → 0 путей; **осталось:** убрать бинарники из истории git |
+
+### 10.2 Честно не сделано (следующий спринт)
+
+* **M3** — reconnect/backoff в UI-воркере (нет).
+* **M6** — CA-цепочка всё ещё константа в `app-rust/src/ui.rs`, нужен конфиг серверов.
+* **M7–M11** — KDF-обёртка хранилища, лимиты параметров JNI (OOM), split crates, BIP-32 edge cases, дубли `hex_decode`.
+* **H6/H7 остатки** — KDF-параметры в JNI, opaque-handle API сида.
+* **Unbuilt (не дефект, а объём):** PQ ratchet, XRCP, групповые чаты, multi-hop routing, chunk-XFTP >64 КБ, `FLAG_SECURE`.
+
+### 10.3 Следующий шаг
+
+Повторный вызов аудиторов на текущем HEAD (`d230b03`) с `ПИСЬМО-АУДИТОРАМ.md` и `АУДИТ-КОДА-2026-11-15.md` — в письме перечислены и закрытые находки с командами проверки, и честно не сделанное. Заявление «крипто/транспорт 100%» из отчётов убрано: статусы только `закрыто` / `частично` / `не начато`.
 
 **Все транспортные блокеры сняты.** Два корня, оба найдены живым прогоном против эталона и закрыты регрессионными тестами:
 1. крипто-слой блоков: нужен pre-слой `HSalsa20(secret, 0^16)`, tag идёт первым (`tag||ct`) — см. §3.3;
