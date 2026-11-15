@@ -3,6 +3,7 @@
 //! Раскладка как в Telegram: слева список чатов, справа переписка, ввод снизу.
 
 use nexxrust::{bip39, control, crypto, keytree};
+use nexxrust::protocols::queue_store;
 use nexxrust::protocols::smp;
 use nexxrust::protocols::smp_client::SmpClient;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -34,6 +35,14 @@ DfYAQmYwtYptS3IrzQ5QVjEG7sOx/tPVJyKE1gYJviquIKJml2dJLshf5kY58DH/
 gNmbtPkDMwoWl/2g0NKyY/UA4qOLVNxQtiW8cMR+bGpGaUuupdL19xygH5lhftuc
 UjjdUuav0c4jAA==
 -----END CERTIFICATE-----";
+
+/// Путь зашифрованного хранилища очередей (стандартная директория данных приложения).
+fn queue_store_path() -> String {
+    let base = std::env::var("ANDROID_APP_PRIVATE_DIR")
+        .or_else(|_| std::env::var("XDG_DATA_HOME").map(|d| format!("{d}/nexx")))
+        .unwrap_or_else(|_| "/data/data/chat.nexx.app/files".to_string());
+    format!("{base}/queues.bin")
+}
 
 enum WorkerCmd {
     Send(String),
@@ -68,19 +77,39 @@ fn chat_worker(
     };
     // Неблокирующий poll: иначе recv_transmissions ждёт до 60 с и команды Send из UI встают в очередь.
     client.set_read_timeout(Some(Duration::from_millis(400)));
-    let auth = match keytree::derive_path_ed25519(&seed, "m/0'/0'/0'") {
-        Some(k) => ed25519_dalek::SigningKey::from_bytes(&k.private),
-        None => return say(ChatEvent::Err("keytree derive failed".into())),
+    // Аудит H5: у каждой очереди — свой индекс и свои ключи (раньше все очереди
+    // использовали m/0'/0'/0' и m/0'/0'/1' — одна идентичность на все серверы).
+    // Реквизиты очереди сохраняются в зашифрованное хранилище, чтобы после
+    // перезапуска можно было восстановить очередь, а не плодить новые.
+    let store_path = std::path::PathBuf::from(queue_store_path());
+    let mut store = match queue_store::QueueStore::open(&store_path, &seed) {
+        Ok(st) => st,
+        Err(e) => return say(ChatEvent::Err(format!("queue store: {e}"))),
     };
-    let dh = match keytree::derive_path_ed25519(&seed, "m/0'/0'/1'") {
-        Some(k) => StaticSecret::from(k.private),
-        None => return say(ChatEvent::Err("keytree dh failed".into())),
+    let label = format!("self@{host}:{port}");
+    let index = store.find_by_label(&label).map(|r| r.index).unwrap_or_else(|| store.next_index());
+    let keys = match queue_store::derive_queue_keys(&seed, index) {
+        Ok(k) => k,
+        Err(e) => return say(ChatEvent::Err(format!("derive queue keys: {e}"))),
     };
+    let auth = keys.auth;
+    let dh = keys.dh;
     say(ChatEvent::Status("NEW queue…".into()));
     let ids = match client.create_queue(&smp::RecipientKeys { auth_signing: auth.clone(), dh_secret: dh.clone() }) {
         Ok(i) => i,
         Err(e) => return say(ChatEvent::Err(format!("NEW: {e}"))),
     };
+    // Сохраняем реквизиты очереди (шифрованное хранилище) — H5.
+    if let Err(e) = store.upsert(queue_store::QueueRecord {
+        index,
+        rcv_id: crypto::hex_encode(&ids.rcv_id),
+        snd_id: crypto::hex_encode(&ids.snd_id),
+        label: label.clone(),
+        host: host.clone(),
+        port,
+    }) {
+        say(ChatEvent::Err(format!("queue store save: {e}")));
+    }
     let eph_bytes: [u8; 32] = crypto::random_bytes(32).try_into().unwrap();
     let eph = StaticSecret::from(eph_bytes);
     let eph_pub_x509 = smp::x25519_x509(X25519Public::from(&eph).as_bytes());
@@ -123,7 +152,15 @@ fn chat_worker(
                         Err(e) => say(ChatEvent::Err(format!("SEND: {e}"))),
                     }
                 }
-                WorkerCmd::Quit => return,
+                WorkerCmd::Quit => {
+                    // Аудит H5: при закрытии удаляем очередь на сервере (DEL),
+                    // чтобы на релее не оставались наши идентификаторы.
+                    if let Err(e) = client.delete_queue(&ids.rcv_id, &auth) {
+                        say(ChatEvent::Err(format!("DEL queue: {e}")));
+                    }
+                    let _ = store.remove(&label);
+                    return;
+                }
             }
         }
         // неблокирующий poll входящих

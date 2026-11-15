@@ -6,3 +6,11 @@ linker = "/home/thomas/build/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebu
 
 [target.x86_64-linux-android]
 linker = "/home/thomas/build/android-sdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android35-clang"
+
+# Пути сборки не должны попадать в релизный артефакт (аудит M5/приёмка:
+# `strings release .so | grep /home/thomas` → пусто).
+[build]
+rustflags = [
+  "--remap-path-prefix=/home/thomas/build/rust/cargo/registry=registry",
+  "--remap-path-prefix=/home/thomas=local",
+]

@@ -679,6 +679,7 @@ dependencies = [
  "rand",
  "ripemd",
  "rustls",
+ "serde",
  "serde_json",
  "sha2",
  "sha3",

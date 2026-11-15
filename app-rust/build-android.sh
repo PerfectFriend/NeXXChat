@@ -39,5 +39,23 @@ for t in $TARGETS; do
     cargo build --release --target "$t"
 
   out="target/$t/release/libnexxapp.so"
+  # Аудит M5: в релизном .so не должно быть абсолютных путей сборки.
+  # Часть строк (ENGINESDIR и т.п.) приходит из vendored OpenSSL — заменяем
+  # префикс на нейтральный той же длины, чтобы длины указателей не поехали.
+  if [ -f "$out" ]; then
+    python3 - "$out" <<'PYEOF'
+import sys
+p = sys.argv[1]
+data = open(p, 'rb').read()
+old = b"/home/thomas"
+new = b"/opt/nexx00"[:len(old)]
+if len(new) != len(old):
+    new = b"/nexx/xx"[:len(old)]
+n = data.count(old)
+if n:
+    open(p, 'wb').write(data.replace(old, new))
+print(f"paths scrubbed in {p}: {n}")
+PYEOF
+  fi
   [ -f "$out" ] && echo "OK: $out ($(stat -c%s "$out") байт)"
 done

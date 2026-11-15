@@ -495,7 +495,13 @@ impl SmpClient {
         let sni = ServerName::try_from(host.to_string()).map_err(|e| format!("SNI: {e}"))?;
         let conn =
             ClientConnection::new(Arc::new(config), sni).map_err(|e| format!("TLS init: {e}"))?;
-        let sock = TcpStream::connect((host, port)).map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
+        // Аудит M2: connect с таймаутом — иначе UI виснет на неотвечающем релее.
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+            .next()
+            .ok_or_else(|| format!("resolve {host}:{port}: нет адресов"))?;
+        let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(15))
+            .map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
         sock.set_read_timeout(Some(Duration::from_secs(60)))
             .map_err(|e| format!("read timeout: {e}"))?;
         sock.set_write_timeout(Some(Duration::from_secs(30)))
@@ -592,8 +598,13 @@ impl SmpClient {
             arr
         };
 
-        let sock =
-            TcpStream::connect((host, port)).map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
+        // Аудит M2: connect с таймаутом.
+        let raddr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+            .next()
+            .ok_or_else(|| format!("resolve {host}:{port}: нет адресов"))?;
+        let sock = TcpStream::connect_timeout(&raddr, Duration::from_secs(15))
+            .map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
         sock.set_read_timeout(Some(Duration::from_secs(60)))
             .map_err(|e| format!("read timeout: {e}"))?;
         sock.set_write_timeout(Some(Duration::from_secs(30)))
