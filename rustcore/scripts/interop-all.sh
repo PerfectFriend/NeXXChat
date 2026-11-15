@@ -11,7 +11,7 @@ BIN=${CARGO_TARGET_DIR:-/home/thomas/build/cache/cargo-target}/release
 export NEXX_TLS=openssl
 
 echo "== build =="
-cargo build --release --bin chat_flow --bin agent_smoke --bin agent_rotate --bin smp_cmds || exit 1
+cargo build --release --bin chat_flow --bin agent_smoke --bin agent_rotate --bin smp_cmds --bin invite_flow || exit 1
 
 run() {
   local name=$1; shift
@@ -23,6 +23,7 @@ run chat_flow "$HOST" | grep -q "CHAT UI FLOW OK" && echo "PASS chat_flow" || ec
 run agent_smoke "$HOST" "$CA" | grep -q "AGENT INTEROP OK" && echo "PASS agent_smoke" || echo "FAIL agent_smoke"
 run agent_rotate "$HOST" "$CA" | grep -q "ROTATE INTEROP OK" && echo "PASS agent_rotate" || echo "FAIL agent_rotate"
 run smp_cmds "$HOST" "$CA" | grep -q "SMP CMDS INTEROP OK" && echo "PASS smp_cmds" || echo "FAIL smp_cmds"
+run invite_flow "$HOST" | grep -q "INVITE FLOW OK" && echo "PASS invite_flow" || echo "FAIL invite_flow"
 
 echo "== unit tests =="
 cargo test --release --lib 2>&1 | grep -E "test result: ok" && echo "PASS unit" || echo "FAIL unit"
