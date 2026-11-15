@@ -41,21 +41,36 @@ for t in $TARGETS; do
   out="target/$t/release/libnexxapp.so"
   # Аудит M5: в релизном .so не должно быть абсолютных путей сборки.
   # Часть строк (ENGINESDIR и т.п.) приходит из vendored OpenSSL — заменяем
-  # префикс на нейтральный той же длины, чтобы длины указателей не поехали.
+  # префикс на нейтральный СТРОГО ТОЙ ЖЕ ДЛИНЫ: сдвиг байтов ломает ELF
+  # (секционные оффсеты перестают совпадать → "file too short" в nm).
   if [ -f "$out" ]; then
     python3 - "$out" <<'PYEOF'
 import sys
 p = sys.argv[1]
 data = open(p, 'rb').read()
 old = b"/home/thomas"
-new = b"/opt/nexx00"[:len(old)]
-if len(new) != len(old):
-    new = b"/nexx/xx"[:len(old)]
+# Замена той же длины, что и "/home/thomas" (12 байт): "/opt/nexx000".
+new = b"/opt/nexx000"
+assert len(new) == len(old), f"replacement must be {len(old)} bytes, got {len(new)}"
 n = data.count(old)
 if n:
-    open(p, 'wb').write(data.replace(old, new))
-print(f"paths scrubbed in {p}: {n}")
+    out = data.replace(old, new)
+    assert len(out) == len(data), "size changed — binary would be corrupted"
+    open(p, 'wb').write(out)
+print(f"paths scrubbed in {p}: {n} (size preserved: {len(data)})")
 PYEOF
   fi
-  [ -f "$out" ] && echo "OK: $out ($(stat -c%s "$out") байт)"
+  # Приёмка: .so после чистки должен остаться валидным ELF с JNI-экспортами.
+  # grep -c (а не -q): -q завершает пайп раньше, nm ловит SIGPIPE и при pipefail
+  # проверка ложно падает.
+  if [ -f "$out" ]; then
+    SZ=$(stat -c%s "$out")
+    NJNI=$(nm -D "$out" 2>/dev/null | grep -c "Java_")
+    if [ "${NJNI:-0}" -gt 0 ]; then
+      echo "OK: $out ($SZ байт, ELF валиден, JNI-экспортов: $NJNI)"
+    else
+      echo "FAIL: $out ($SZ байт) — ELF повреждён после чистки путей" >&2
+      exit 1
+    fi
+  fi
 done
