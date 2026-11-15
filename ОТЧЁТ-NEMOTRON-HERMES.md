@@ -135,11 +135,13 @@ cd ~/Projects/NeXX && ./gradlew :app:assembleDebug      # → NeXX-rust-debug.ap
 
 ## 8. APK и доставка
 
-* `~/apkexport/NeXX-allabi-debug.apk` — **59 111 214 байт**, три ABI внутри (проверено `unzip -l`): arm64-v8a (15 142 332 Б), armeabi-v7a (10 668 096 Б), x86_64 (16 901 260 Б).
+* `~/apkexport/NeXX-allabi-debug.apk` — **59 111 234 байт**, три ABI внутри (проверено `unzip -l`): arm64-v8a (15 142 352 Б), armeabi-v7a (10 668 116 Б), x86_64 (16 901 280 Б).
 * Имя по правилу владельца: `<Проект>-<abi>-debug.apk`.
 * Доставка в Telegram-топик `-1004431090317:23616`: Bot API режет 50 МБ → для крупных файлов MTProto (`~/Projects/TGSend/tg_send_file.py`, venv `~/.hermes/installs/tg-mtproto/venv`, `api_id/api_hash/phone` в `~/.hermes/secrets/tg_mtproto.env` — значения не хранятся вне секретов).
-* Последняя доставка: **`id=31691`**, `size=59111214`, `chat=-1004431090317`, `topic=23616` (MTProto, подтверждено выводом отправщика).
-* **Проверка содержимого APK (приёмка аудита):** в `.so` внутри APK — `secret=`/`sessId=`/`WORKS=` → **0 совпадений**; `/home/thomas` → **0 совпадений** (пути вычищены: `--remap-path-prefix` + пост-обработка в `app-rust/build-android.sh`).
+* Последняя доставка: **`id=31692`**, `size=59111234`, `chat=-1004431090317`, `topic=23616` (MTProto, подтверждено выводом отправщика).
+* **⚠️ id=31691 — БИТЫЙ, не использовать:** пост-обработка путей заменяла `/home/thomas` (12 Б) на 8 байт, ELF сдвигался на 20 Б и переставал читаться (`nm: file too short`, 0 JNI-экспортов). Исправлено в коммите `1ba87cb` (замена строго равной длины + assert на размер + приёмка `nm -D | grep -c 'Java_' > 0` в `app-rust/build-android.sh`).
+* **Проверка содержимого APK (приёмка аудита):** в `.so` внутри APK — `secret=`/`sessId=`/`WORKS=` → **0 совпадений**; `/home/thomas` → **0 совпадений** (пути вычищены: `--remap-path-prefix` + пост-обработка равной длины).
+* **Проверка целостности ELF:** `readelf --dyn-syms` по всем трём `.so` внутри APK → **29 JNI-экспортов в каждом** (arm64-v8a / armeabi-v7a / x86_64).
 * Манифест: `allowBackup=false`, `fullBackupContent=false`, `dataExtractionRules` (бэкап исключён), `usesCleartextTraffic=false` — проверено `aapt2 dump xmltree` по собранному APK.
 
 ## 9. Тесты и верификация (фактический вывод)
