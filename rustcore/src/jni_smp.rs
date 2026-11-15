@@ -173,11 +173,14 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpSendText(
     let text = get_str(&mut env, text);
     let res = with_session(session as i64, |s| -> Result<String, String> {
         let eph_pub_x509 = x25519_x509(X25519Public::from(&s.eph).as_bytes());
-        let body = encrypt_client_msg(s.e2e.as_bytes(), s.client.version, Some(&eph_pub_x509), text.as_bytes())
+        // ClientMessage = PrivHeader('_') + текст
+        let mut plain = vec![b'_'];
+        plain.extend_from_slice(text.as_bytes());
+        let body = encrypt_client_msg(s.e2e.as_bytes(), s.client.version, Some(&eph_pub_x509), &plain)
             .map_err(|e| e.to_string())?;
         let cmd = crate::protocols::smp::cmd_send(false, &body);
         s.client
-            .send_message(&s.ids.snd_id, s.e2e.as_bytes(), Some(&eph_pub_x509), text.as_bytes(), b"")
+            .send_message(&s.ids.snd_id, s.e2e.as_bytes(), Some(&eph_pub_x509), &plain, b"")
             .map_err(|e| e.to_string())?;
         let _ = cmd;
         Ok("{\"ok\":true}".to_string())

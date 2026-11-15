@@ -1541,6 +1541,7 @@ dependencies = [
  "pollster",
  "wgpu",
  "winit",
+ "x25519-dalek",
 ]
 
 [[package]]
