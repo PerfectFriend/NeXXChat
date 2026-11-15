@@ -26,14 +26,20 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 crypto_secretbox = "0.1"
 hkdf = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-openssl = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
+webpki-roots = "0.26"
+# Android: собираем OpenSSL из исходников (vendored) — в NDK готовой libssl нет.
+[target.'cfg(target_os = "android")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 tokio-openssl = "0.6.5"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+openssl = "0.10"
+tokio-openssl = "0.6.5"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
 h2 = "0.4"
 http = "1"
 bytes = "1"
 futures = "0.3"
-webpki-roots = "0.26"
 
 [profile.release]
 opt-level = 2

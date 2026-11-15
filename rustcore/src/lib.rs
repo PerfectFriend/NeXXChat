@@ -9,6 +9,7 @@ mod jni_api;
 pub mod proxy_parse;
 
 pub mod protocols;
+mod jni_smp;
 
 #[cfg(test)]
 mod control_tests;

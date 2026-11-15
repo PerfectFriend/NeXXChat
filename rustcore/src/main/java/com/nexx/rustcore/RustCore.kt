@@ -107,4 +107,28 @@ object RustCore {
     /** JSON {"ok","nodes":[{index,id,identityKey,storageKey,chatKey}]} — план флота. */
     @JvmStatic
     external fun keyFleetPlan(seedHex: String, nodeCount: Int): String
+
+    /** JSON {"ok","session","version"} — TLS-подключение к SMP-релею. caPem пустой = системные корни/openssl дефолт. */
+    @JvmStatic
+    external fun smpConnect(host: String, port: Int, caPem: String): String
+
+    /** JSON {"ok","rcvId","sndId"} (hex) — создать очередь на сессии. */
+    @JvmStatic
+    external fun smpNewQueue(session: Long): String
+
+    /** JSON {"ok"} — отправить e2e-шифрованный текст в свою очередь. */
+    @JvmStatic
+    external fun smpSendText(session: Long, text: String): String
+
+    /** JSON {"ok","messages":[{"msgId","body","hex"}]} — неблокирующий опрос входящих. */
+    @JvmStatic
+    external fun smpPoll(session: Long): String
+
+    /** JSON {"ok"} — ACK сообщения по msgId (hex). */
+    @JvmStatic
+    external fun smpAck(session: Long, msgIdHex: String): String
+
+    /** JSON {"ok"} — закрыть сессию. */
+    @JvmStatic
+    external fun smpClose(session: Long): String
 }
