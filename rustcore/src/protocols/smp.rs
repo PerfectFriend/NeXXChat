@@ -47,6 +47,8 @@ pub const X25519_SPKI_PREFIX: [u8; 12] = [
 ];
 /// SPKI-префикс Ed448 (X.509 SubjectPublicKeyInfo). Публичные релеи SimpleX
 /// v7.1+ используют Ed448-сертификаты (и требуют ed448 в sigalgs ClientHello).
+/// ВНИМАНИЕ: длина BIT STRING здесь 58 байт (0x3a), не 66 — релеи v7.1+ кладут
+/// 58-байтный ключ; с префиксом 0x30 0x2f верификация падает.
 pub const ED448_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x43, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x71, 0x03, 0x3a, 0x00,
 ];
@@ -269,6 +271,8 @@ pub struct RecipientKeys {
 }
 
 /// `NEW <rcvAuthKey> <rcvDhKey> <basicAuth> <subMode> [queueReqData] [ntfCreds]`.
+/// queueReqData: `"1M0"` = Just(QRMessaging Nothing) — обязателен для работы SKEY
+/// (иначе queueMode=None и allowedKey для SKEY падает в AUTH).
 pub fn cmd_new(
     version: u16,
     rcv_auth_x509: &[u8],
@@ -353,6 +357,9 @@ pub fn cmd_off() -> Vec<u8> {
 }
 
 /// `SKEY <senderAuthKey>`
+/// ВАЖНО: сервер примет SKEY только если очередь создана с queueMode=QMMessaging
+/// (в NEW передать queueReqData = "1M0"), иначе ответ `ERR AUTH`.
+/// Подписывается НОВЫМ ключом отправителя (а не старым ключом получателя).
 pub fn cmd_skey(sender_auth_x509: &[u8]) -> Result<Vec<u8>, SmpError> {
     let mut out = Vec::new();
     out.extend_from_slice(b"SKEY ");

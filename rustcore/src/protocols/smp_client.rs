@@ -43,6 +43,10 @@ pub trait TlsIo: Send {
     fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()>;
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>;
     fn flush(&mut self) -> std::io::Result<()>;
+    /// Тайм-аут чтения нижележащего TCP-сокета. Нужен неблокирующему poll:
+    /// без него read_exact блокируется до 60 с (дефолтный тайм-аут подключения),
+    /// и команды из UI ждут в очереди. По умолчанию — ничего не делает.
+    fn set_read_timeout(&mut self, _d: Option<Duration>) {}
 }
 
 impl TlsIo for TlsStream {
@@ -54,6 +58,9 @@ impl TlsIo for TlsStream {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Write::flush(self)
+    }
+    fn set_read_timeout(&mut self, d: Option<Duration>) {
+        let _ = self.get_mut().set_read_timeout(d);
     }
 }
 
@@ -85,6 +92,9 @@ impl TlsIo for OpensslStream {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Write::flush(&mut self.inner)
+    }
+    fn set_read_timeout(&mut self, d: Option<Duration>) {
+        let _ = self.inner.get_mut().set_read_timeout(d);
     }
 }
 
@@ -732,6 +742,13 @@ impl SmpClient {
         Ok(corr_id)
     }
 
+    /// Устанавливает тайм-аут чтения сокета. Для неблокирующего poll ставьте
+    /// малое значение (напр. 300 мс): read_exact тогда возвращает
+    /// WouldBlock/"Resource temporarily unavailable" вместо блокировки до 60 с.
+    pub fn set_read_timeout(&mut self, d: Option<Duration>) {
+        self.stream.set_read_timeout(d);
+    }
+
     /// Читает следующую порцию transmissions.
     pub fn recv_transmissions(&mut self) -> SmpResult<Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>> {
         let batch = self.read_block()?;
@@ -756,6 +773,8 @@ impl SmpClient {
             for (auth, corr, entity, cmd) in items {
                 if corr.is_empty() {
                     // Уведомление сервера (например, сообщение очереди).
+                    // MSG может прийти в том же batch, что и ответ на нашу команду
+                    // (например, на ACK) — складываем в pending, заберём позже.
                     if cmd.starts_with(b"MSG ") {
                         self.pending.push(cmd);
                     }
@@ -840,6 +859,9 @@ impl SmpClient {
     }
 
     /// Подписывается на очередь (`SUB`).
+    /// ВАЖНО (протокол): SUB и GET несовместимы в одном соединении — сервер вернёт
+    /// `ERR CMD PROHIBITED`, если в этой же сессии уже использовался GET.
+    /// После SUB сервер пушит `MSG` сам, без ручного GET.
     pub fn subscribe(&mut self, rcv_id: &[u8], signing_key: &SigningKey) -> SmpResult<()> {
         let cmd = cmd_sub();
         let corr_id = new_corr_id();

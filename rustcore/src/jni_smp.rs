@@ -11,11 +11,10 @@ use jni::JNIEnv;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::protocols::smp::{
-    decrypt_client_msg, decrypt_rcv_msg, ed25519_x509, encrypt_client_msg, parse_msg, parse_priv_header,
-    sign_command, x25519_x509, RecipientKeys, ServerResponse,
+    decrypt_client_msg, decrypt_rcv_msg, parse_msg, parse_priv_header,
+    x25519_x509, RecipientKeys,
 };
 use crate::protocols::smp_client::{SmpAddress, SmpClient};
-use crate::protocols::smp_wire::{encode_batch, encode_transmission_v, new_corr_id, Transmission};
 
 fn to_jstring(env: &mut JNIEnv, s: String) -> jstring {
     match env.new_string(s) {
@@ -70,7 +69,10 @@ fn with_session<R>(id: i64, f: impl FnOnce(&mut Session) -> R) -> Result<R, Stri
     Ok(f(s))
 }
 
-/// String smpConnect(String host, int port, String caPemOrEmpty) -> {"ok":true,"session":N}
+/// String smpConnect(String host, int port, String caPemOrEmpty, String authSkHex, String dhSkHex)
+///   -> {"ok":true,"session":N,"version":V}
+/// Ключи очереди (ed25519 signing key + x25519 dh, hex) приходят из keytree на стороне
+/// Kotlin — здесь НЕ должно быть дефолтных/захардкоженных ключей.
 #[no_mangle]
 pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpConnect(
     mut env: JNIEnv,
@@ -78,24 +80,36 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpConnect(
     host: JString,
     port: jni::sys::jint,
     ca_pem: JString,
+    auth_sk_hex: JString,
+    dh_sk_hex: JString,
 ) -> jstring {
     let host = get_str(&mut env, host);
     let ca = get_str(&mut env, ca_pem);
+    let auth_hex = get_str(&mut env, auth_sk_hex);
+    let dh_hex = get_str(&mut env, dh_sk_hex);
     let ca_opt = if ca.is_empty() { None } else { Some(ca) };
     let use_openssl = std::env::var("NEXX_TLS").map(|v| v == "openssl").unwrap_or(true);
     let res = (|| -> Result<String, String> {
+        let auth_b = crate::crypto::hex_decode(&auth_hex).ok_or("auth key: bad hex")?;
+        let dh_b = crate::crypto::hex_decode(&dh_hex).ok_or("dh key: bad hex")?;
+        if auth_b.len() != 32 || dh_b.len() != 32 {
+            return Err("auth/dh keys must be 32 bytes".into());
+        }
         let addr = SmpAddress::parse(&format!("{host}:{port}")).map_err(|e| e.to_string())?;
-        let client = if use_openssl {
+        let mut client = if use_openssl {
             SmpClient::connect_openssl_with_ca(&addr.host, addr.port, ca_opt.as_deref())
         } else {
             SmpClient::connect_with_ca(&addr.host, addr.port, ca_opt.as_deref())
         }
         .map_err(|e| e.to_string())?;
-        // дефолтные ключи очереди; реальные — из keytree в приложении
-        let auth = SigningKey::from_bytes(&[7u8; 32]);
-        let dh = StaticSecret::from([8u8; 32]);
-        let eph = StaticSecret::from([9u8; 32]);
-        let _ = client.version;
+        // Неблокирующий poll: read timeout 300 мс, чтобы smpPoll не блокировал JNI-поток.
+        client.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+        let auth = SigningKey::from_bytes(&auth_b.try_into().unwrap());
+        let dh_b32: [u8; 32] = dh_b.try_into().map_err(|_| "dh key: не 32 байта")?;
+        let dh = StaticSecret::from(dh_b32);
+        let mut eph_b = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut eph_b);
+        let eph = StaticSecret::from(eph_b);
         let id = {
             let mut n = NEXT_ID.lock().unwrap();
             let id = *n;
@@ -139,7 +153,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpNewQueue(
     _class: JClass,
     session: jni::sys::jlong,
 ) -> jstring {
-    let res = with_session(session as i64, |s| -> Result<String, String> {
+    let res = with_session(session, |s| -> Result<String, String> {
         let keys = RecipientKeys { auth_signing: s.auth.clone(), dh_secret: s.dh.clone() };
         let ids = s.client.create_queue(&keys).map_err(|e| e.to_string())?;
         // теперь можем посчитать реальные e2e/srv секреты
@@ -171,18 +185,14 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpSendText(
     text: JString,
 ) -> jstring {
     let text = get_str(&mut env, text);
-    let res = with_session(session as i64, |s| -> Result<String, String> {
+    let res = with_session(session, |s| -> Result<String, String> {
         let eph_pub_x509 = x25519_x509(X25519Public::from(&s.eph).as_bytes());
-        // ClientMessage = PrivHeader('_') + текст
+        // ClientMessage = PrivHeader('_') + текст; send_message сам оборачивает в конверт.
         let mut plain = vec![b'_'];
         plain.extend_from_slice(text.as_bytes());
-        let body = encrypt_client_msg(s.e2e.as_bytes(), s.client.version, Some(&eph_pub_x509), &plain)
-            .map_err(|e| e.to_string())?;
-        let cmd = crate::protocols::smp::cmd_send(false, &body);
         s.client
             .send_message(&s.ids.snd_id, s.e2e.as_bytes(), Some(&eph_pub_x509), &plain, b"")
             .map_err(|e| e.to_string())?;
-        let _ = cmd;
         Ok("{\"ok\":true}".to_string())
     });
     match res {
@@ -200,12 +210,13 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpPoll(
     _class: JClass,
     session: jni::sys::jlong,
 ) -> jstring {
-    let res = with_session(session as i64, |s| -> Result<String, String> {
+    let res = with_session(session, |s| -> Result<String, String> {
         let mut out = String::from("{\"ok\":true,\"messages\":[");
         let mut first = true;
-        // сначала из внутреннего pending клиента
+        // сначала из внутреннего pending клиента (wait_response складывает туда MSG)
         let mut cmds: Vec<Vec<u8>> = s.client.take_pending();
-        // затем пробуем прочитать один блок без блокировки
+        // затем один блок с коротким read timeout (300 мс выставляется в smpConnect):
+        // тайм-аут чтения = "ничего не пришло", это норма для poll.
         match s.client.recv_transmissions() {
             Ok(items) => {
                 for (_a, corr, _e, cmd) in items {
@@ -214,7 +225,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpPoll(
                     }
                 }
             }
-            Err(e) if e.contains("Resource temporarily unavailable") => {}
+            Err(e) if e.contains("Resource temporarily unavailable") || e.contains("timed out") => {}
             Err(e) => return Err(e.to_string()),
         }
         for cmd in cmds {
@@ -253,7 +264,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpAck(
     msg_id_hex: JString,
 ) -> jstring {
     let hex = get_str(&mut env, msg_id_hex);
-    let res = with_session(session as i64, |s| -> Result<String, String> {
+    let res = with_session(session, |s| -> Result<String, String> {
         let msg_id = crate::crypto::hex_decode(&hex).ok_or("bad hex")?;
         s.client.ack(&s.ids.rcv_id, &s.auth, &msg_id).map_err(|e| e.to_string())?;
         Ok("{\"ok\":true}".to_string())
@@ -273,17 +284,10 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpClose(
     session: jni::sys::jlong,
 ) -> jstring {
     let mut guard = sessions();
-    let removed = guard.as_mut().and_then(|m| m.remove(&(session as i64)));
+    let removed = guard.as_mut().and_then(|m| m.remove(&session));
     let s = match removed {
         Some(_) => "{\"ok\":true}",
         None => "{\"ok\":false,\"error\":\"session not found\"}",
     };
     to_jstring(&mut env, s.to_string())
-}
-
-// держим импорты живыми
-#[allow(dead_code)]
-fn _keep() {
-    let _ = (ed25519_x509, sign_command, encode_batch, encode_transmission_v, new_corr_id);
-    let _ = ServerResponse::Ok;
 }

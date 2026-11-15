@@ -66,6 +66,8 @@ fn chat_worker(
         Ok(c) => c,
         Err(e) => return say(ChatEvent::Err(format!("connect: {e}"))),
     };
+    // Неблокирующий poll: иначе recv_transmissions ждёт до 60 с и команды Send из UI встают в очередь.
+    client.set_read_timeout(Some(Duration::from_millis(400)));
     let auth = match keytree::derive_path_ed25519(&seed, "m/0'/0'/0'") {
         Some(k) => ed25519_dalek::SigningKey::from_bytes(&k.private),
         None => return say(ChatEvent::Err("keytree derive failed".into())),
@@ -141,7 +143,7 @@ fn chat_worker(
                     }
                 }
             }
-            Err(e) if e.contains("Resource temporarily unavailable") => {}
+            Err(e) if e.contains("Resource temporarily unavailable") || e.contains("timed out") => {}
             Err(e) => say(ChatEvent::Err(format!("recv: {e}"))),
         }
         let mut pending = client.take_pending();

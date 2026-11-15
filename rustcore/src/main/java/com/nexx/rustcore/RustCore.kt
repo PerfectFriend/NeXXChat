@@ -108,9 +108,9 @@ object RustCore {
     @JvmStatic
     external fun keyFleetPlan(seedHex: String, nodeCount: Int): String
 
-    /** JSON {"ok","session","version"} — TLS-подключение к SMP-релею. caPem пустой = системные корни/openssl дефолт. */
+    /** JSON {"ok","session","version"} — TLS-подключение к SMP-релею. caPem пустой = дефолт; authSkHex/dhSkHex — 32-байтные ключи очереди (hex) из keytree. */
     @JvmStatic
-    external fun smpConnect(host: String, port: Int, caPem: String): String
+    external fun smpConnect(host: String, port: Int, caPem: String, authSkHex: String, dhSkHex: String): String
 
     /** JSON {"ok","rcvId","sndId"} (hex) — создать очередь на сессии. */
     @JvmStatic
