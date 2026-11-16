@@ -187,24 +187,31 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 | H4 (damaged ACK) | ✅ закрыто | poll не рвётся на битом сообщении: ACK + счётчик `damaged` |
 | H5 (ключи очередей) | ✅ закрыто | `protocols/queue_store.rs`: уникальный индекс `m/0'/0'/{i}'` + `m/0'/1'/{i}'`, шифрование AES-256-GCM, `DEL` при закрытии |
 | H6 (BIP39) | ⚠️ частично | единая `seed_from_mnemonic` (SHA-512/2048) + NFKD, 15/18/21 слов; **осталось:** убрать произвольные KDF-параметры из JNI |
-| H7 (сид через JNI) | ⚠️ частично | `Zeroize`/`ZeroizeOnDrop` есть; **осталось:** opaque-handle API вместо `seedHex` в сигнатурах |
+| H7 (сид через JNI) | ✅ закрыто | opaque seed handles (seedImport/seedRelease/key*ByHandle, Zeroizing-хранилище); seedHex убран из публичных JNI-сигнатур |
 | H8 (Debug/логи) | ✅ закрыто | `XKey: Debug` → `<redacted>` |
 | M1 (JSON) | ✅ закрыто | `serde_json` вместо ручной экранировки |
 | M2 (connect) | ✅ закрыто | `connect_timeout` 15 с |
-| M4 (манифест) | ⚠️ частично | `allowBackup=false`, `dataExtractionRules`, `usesCleartextTraffic=false`; **осталось:** `FLAG_SECURE`, secure-input поля сида в egui |
-| M5 (пути/сборка) | ⚠️ частично | `strings .so` → 0 путей; **осталось:** убрать бинарники из истории git |
+| M4 (манифест) | ✅ закрыто | `allowBackup=false`, `dataExtractionRules`, `usesCleartextTraffic=false`, `FLAG_SECURE` в android_main, password-поле seed в egui |
+| M5 (пути/сборка) | ✅ закрыто | `strings .so` → 0 путей; `.so`/`.aar` вычищены из истории git (pack 10670→277 КБ), .gitignore |
 
 ### 10.2 Честно не сделано (следующий спринт)
 
-* **M3** — reconnect/backoff в UI-воркере (нет).
-* **M6** — CA-цепочка всё ещё константа в `app-rust/src/ui.rs`, нужен конфиг серверов.
-* **M7–M11** — KDF-обёртка хранилища, лимиты параметров JNI (OOM), split crates, BIP-32 edge cases, дубли `hex_decode`.
-* **H6/H7 остатки** — KDF-параметры в JNI, opaque-handle API сида.
-* **Unbuilt (не дефект, а объём):** PQ ratchet, XRCP, групповые чаты, multi-hop routing, chunk-XFTP >64 КБ, `FLAG_SECURE`.
+* **ЗАКРЫТО 2026-11-16 (коммиты `80ac1ed`, `aa234f0`, `befd9c9`, `e510493`):**
+  * **M3** — reconnect/backoff в chat_worker (экспоненциальный 1s→30s, сброс при успехе).
+  * **M4** — `FLAG_SECURE` через `set_window_flags` в `android_main` + password-поле ввода seed в egui.
+  * **M5** — `*.so`/`*.aar`/`jniLibs/` вычищены из всей истории git (filter-branch + gc, pack 10670→277 КБ), `.gitignore`.
+  * **M6** — `app-rust/src/servers.rs`: конфиг релеев (host/port/CA/key_hash), CA только из конфига.
+  * **M7** — `hash_seed_phrase` = PBKDF2-HMAC-SHA256(600k) с персональной солью.
+  * **M8** — лимиты JNI: input ≤4M, randomHex [0,4096], AES-GCM hex ≤32M; KDF-параметры фиксированы в ядре.
+  * **M9** — domain separation: `subseed(domain)`, fleet в домене "fleet".
+  * **M10** — `parse_path`: hardened ≥2^31 → None (был wrap u32), нецифры → None.
+  * **M11** — `jstr!` вместо silent-empty `get_str`; дубль `hex_decode` удалён.
+  * **H6/H7 остатки** — фиксированные KDF-параметры; opaque seed handles (`seedImport`/`seedRelease`/`key*ByHandle`).
+* **Unbuilt (не дефект, а объём):** PQ ratchet, XRCP, групповые чаты, multi-hop routing, chunk-XFTP >64 КБ.
 
 ### 10.3 Следующий шаг
 
-Повторный вызов аудиторов на текущем HEAD (`d230b03`) с `ПИСЬМО-АУДИТОРАМ.md` и `АУДИТ-КОДА-2026-11-15.md` — в письме перечислены и закрытые находки с командами проверки, и честно не сделанное. Заявление «крипто/транспорт 100%» из отчётов убрано: статусы только `закрыто` / `частично` / `не начато`.
+Повторный вызов аудиторов на текущем HEAD (`e510493`) с `ПИСЬМО-АУДИТОРАМ.md` и `АУДИТ-КОДА-2026-11-15.md` — все находки C/H/M закрыты, в таблице аудита статусы только `✅ закрыто` по транспорту/крипто/JNI.
 
 **Все транспортные блокеры сняты.** Два корня, оба найдены живым прогоном против эталона и закрыты регрессионными тестами:
 1. крипто-слой блоков: нужен pre-слой `HSalsa20(secret, 0^16)`, tag идёт первым (`tag||ct`) — см. §3.3;
