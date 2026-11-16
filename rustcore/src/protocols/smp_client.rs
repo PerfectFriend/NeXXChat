@@ -1179,4 +1179,55 @@ mod tests {
         let plain = crypto_box_decrypt(&sk2, &nonce2, &block).unwrap();
         assert_eq!(unpad(&plain).unwrap(), content);
     }
+
+    /// Мок TlsIo: чтение всегда возвращает WouldBlock (как сокет с таймаутом poll).
+    struct MockWouldBlock;
+    impl TlsIo for MockWouldBlock {
+        fn read_exact(&mut self, _buf: &mut [u8]) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "timed out"))
+        }
+        fn read_some(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "timed out"))
+        }
+        fn write_all(&mut self, _buf: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Регрессионный тест аудита (Этап 1 плана): poll с таймаутом НЕ должен
+    /// висеть дефолтные 60 с — возвращает ошибку таймаута быстро.
+    #[test]
+    fn poll_timeout_returns_fast_not_60s() {
+        let mut client = SmpClient {
+            stream: Box::new(MockWouldBlock),
+            read_buf: Vec::new(),
+            poll_timeout: Duration::from_millis(50),
+            version: 7,
+            session_id: vec![0u8; 32],
+            server_session_pub: None,
+            cert_der: vec![],
+            key_hash: vec![],
+            expected_key_hash: None,
+            smp_ca_fingerprint: None,
+            pending: vec![],
+            client_dh: StaticSecret::random_from_rng(rand::rngs::OsRng),
+            snd_chain: None,
+            rcv_chain: None,
+            session_secret: None,
+        };
+        client.set_read_timeout(Some(Duration::from_millis(50)));
+        let start = std::time::Instant::now();
+        let r = client.recv_transmissions();
+        let elapsed = start.elapsed();
+        assert!(r.is_err(), "poll при таймауте должен вернуть Err");
+        let msg = r.err().unwrap().to_string();
+        assert!(
+            msg.contains("timed out") || msg.contains("WouldBlock") || msg.contains("Resource temporarily unavailable"),
+            "ожидалась ошибка таймаута, получено: {msg}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "poll висит {elapsed:?} — регрессия неблокирующего чтения");
+    }
 }

@@ -10,7 +10,6 @@
 //! Поэтому SNI не шлём, идентификатор релея сверяем по keyHash = SHA-256(CA DER).
 
 use bytes::Bytes;
-use futures::stream::StreamExt;
 use openssl::ssl::{SslConnector, SslMethod, SslVersion};
 use sha2::Digest;
 use tokio::net::TcpStream;
@@ -194,7 +193,7 @@ async fn main() {
                 Err(_) => break,
             }
         }
-        println!("  POST {}B -> HTTP {status}, {}B body", data.len() + 0, data.len());
+        println!("  POST {}B -> HTTP {status}, {}B body", data.len(), data.len());
         Bytes::from(data)
     }
 

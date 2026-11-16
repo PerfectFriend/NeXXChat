@@ -48,7 +48,7 @@ fn main() {
         if let Some((pk, cands, sig)) = nexxrust::protocols::smp::extract_signed_pubkey(&h.signed_object) {
             println!("server x25519 pub: {:02x?}", &pk[..8]);
             println!("sig len={} cands={}", sig.len(), cands.len());
-            println!("signed_object hex: {:02x?}", &h.signed_object);
+            println!("signed_object hex: {:02x?}", h.signed_object);
             let leaf = tls.ssl().peer_certificate().unwrap();
             println!("leaf pubkey alg: {:?}", leaf.public_key().unwrap().id());
             let leaf_der = leaf.to_der().unwrap();

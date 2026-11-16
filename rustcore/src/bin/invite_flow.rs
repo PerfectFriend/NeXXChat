@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! INVITE FLOW: установление 1-1 контакта между двумя клиентами NeXX через
 //! публичный SMP-релей — полный цикл:
 //!   Alice: NEW+SUB → connReqData → URI `nexx://link#/...`

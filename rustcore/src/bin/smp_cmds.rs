@@ -9,7 +9,7 @@ use std::time::Instant;
 use ed25519_dalek::SigningKey;
 use nexxrust::protocols::smp::{
     cmd_ack, cmd_del, cmd_get, cmd_new, cmd_off, cmd_send, cmd_skey, decrypt_rcv_msg, ed25519_x509,
-    encrypt_client_msg, parse_msg, sign_command, x25519_x509, RecipientKeys, ServerResponse,
+    encrypt_client_msg, sign_command, x25519_x509, RecipientKeys, ServerResponse,
 };
 use nexxrust::protocols::smp_client::{SmpAddress, SmpClient};
 use nexxrust::protocols::smp_wire::{encode_batch, encode_transmission_v, new_corr_id, Transmission};
@@ -87,7 +87,7 @@ fn main() {
     // NEW без подписки, чтобы сообщения ждали GET
     let auth = SigningKey::from_bytes(&[42u8; 32]);
     let dh = StaticSecret::from([77u8; 32]);
-    let keys = RecipientKeys { auth_signing: auth.clone(), dh_secret: dh.clone() };
+    let _keys = RecipientKeys { auth_signing: auth.clone(), dh_secret: dh.clone() };
     let auth_pub = ed25519_x509(auth.verifying_key().as_bytes());
     let dh_pub = x25519_x509(X25519Public::from(&dh).as_bytes());
     let cmd = cmd_new(client.version, &auth_pub, &dh_pub, None, false, Some(b"M0"), None).unwrap();

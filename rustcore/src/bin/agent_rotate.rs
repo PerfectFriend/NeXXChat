@@ -1,3 +1,5 @@
+#![allow(unused_assignments, clippy::if_same_then_else)]
+#![allow(dead_code)]
 //! Ротация очередей поверх SMP против публичного релея (две очереди, одна сессия):
 //! NEW q1, NEW q2 -> на snd1: HELLO, QADD(newQueue q2), QUSE -> на snd2: A_MSG,
 //! приём всех MSG с дешифровкой (server layer per-queue + e2e), ACK всех, DEL обеих.
@@ -9,7 +11,7 @@ use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 use nexxrust::protocols::smp::{
-    decrypt_rcv_msg, decrypt_client_msg, ed25519_x509, encrypt_client_msg, parse_msg, parse_priv_header,
+    decrypt_rcv_msg, decrypt_client_msg, encrypt_client_msg, parse_msg, parse_priv_header,
     x25519_x509, RecipientKeys,
 };
 use nexxrust::protocols::smp_client::{SmpAddress, SmpClient};

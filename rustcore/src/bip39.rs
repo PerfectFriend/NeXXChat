@@ -128,7 +128,7 @@ mod tests {
     /// одинаковая соль — детерминированный результат. Не голый SHA-256.
     #[test]
     fn m7_seed_hash_is_salted_kdf() {
-        let words: Vec<String> = vec!["abandon"; 12].iter().map(|s| s.to_string()).collect();
+        let words: Vec<String> = ["abandon"; 12].iter().map(|s| s.to_string()).collect();
         let h1 = hash_seed_phrase(&words, b"salt-A");
         let h2 = hash_seed_phrase(&words, b"salt-A");
         let h3 = hash_seed_phrase(&words, b"salt-B");

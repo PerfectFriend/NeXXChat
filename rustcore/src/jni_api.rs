@@ -426,39 +426,6 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyFleetPlanByHandle(
     to_jstring(&mut env, json.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn seed_handle_roundtrip_and_release() {
-        let h = seed_store_insert(vec![0xAB; 64]);
-        assert!(h > 0);
-        assert_eq!(seed_store_get(h), Some(vec![0xAB; 64]));
-        assert!(seed_store_remove(h));
-        assert!(seed_store_get(h).is_none());
-        assert!(!seed_store_remove(h)); // повторный release → false
-    }
-
-    #[test]
-    fn seed_handles_are_unique_and_isolated() {
-        let a = seed_store_insert(vec![1; 32]);
-        let b = seed_store_insert(vec![2; 32]);
-        assert_ne!(a, b);
-        assert_eq!(seed_store_get(a), Some(vec![1; 32]));
-        assert_eq!(seed_store_get(b), Some(vec![2; 32]));
-        seed_store_remove(a);
-        seed_store_remove(b);
-    }
-
-    #[test]
-    fn random_hex_upper_bound() {
-        assert_eq!(MAX_RANDOM_BYTES, 4096);
-        assert_eq!(i32::MAX.clamp(0, MAX_RANDOM_BYTES), 4096);
-        assert_eq!((-5).clamp(0, MAX_RANDOM_BYTES), 0);
-    }
-}
-
 // ---------- Control plane (фаза 4) ----------
 
 /// long portAllocAcquire(String lockFile, int start, int end) → порт или -1
@@ -601,4 +568,37 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_parseSsLink(
 ) -> jstring {
     let l = jstr!(&mut env, link);
     to_jstring(&mut env, crate::control::parse_ss_link(&l).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_handle_roundtrip_and_release() {
+        let h = seed_store_insert(vec![0xAB; 64]);
+        assert!(h > 0);
+        assert_eq!(seed_store_get(h), Some(vec![0xAB; 64]));
+        assert!(seed_store_remove(h));
+        assert!(seed_store_get(h).is_none());
+        assert!(!seed_store_remove(h)); // повторный release → false
+    }
+
+    #[test]
+    fn seed_handles_are_unique_and_isolated() {
+        let a = seed_store_insert(vec![1; 32]);
+        let b = seed_store_insert(vec![2; 32]);
+        assert_ne!(a, b);
+        assert_eq!(seed_store_get(a), Some(vec![1; 32]));
+        assert_eq!(seed_store_get(b), Some(vec![2; 32]));
+        seed_store_remove(a);
+        seed_store_remove(b);
+    }
+
+    #[test]
+    fn random_hex_upper_bound() {
+        assert_eq!(MAX_RANDOM_BYTES, 4096);
+        assert_eq!(i32::MAX.clamp(0, MAX_RANDOM_BYTES), 4096);
+        assert_eq!((-5).clamp(0, MAX_RANDOM_BYTES), 0);
+    }
 }

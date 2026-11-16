@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: cargo test + clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustcore
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build
+        run: cargo build --release --lib --bins
+      - name: Unit + регрессионные тесты
+        run: cargo test --release
+      - name: Clippy (должен быть 0 warnings)
+        run: cargo clippy --release --all-targets -- -D warnings
+
+  interop:
+    name: Живые интеропы против публичных релеев SimpleX
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rustcore
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: SMP/XFTP interop (smp6.simplex.im:5223, xftp1.simplex.im:443)
+        run: bash scripts/interop-all.sh smp6.simplex.im:5223
+        env:
+          NEXX_TLS: openssl
