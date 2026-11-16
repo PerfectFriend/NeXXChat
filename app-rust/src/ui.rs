@@ -315,7 +315,8 @@ impl NeXXUi {
             }
             ui.add_space(8.0);
             ui.label("Или введите существующую мнемонику:");
-            ui.text_edit_multiline(&mut self.mnemonic_input);
+            // Аудит M4: поле сида — password-режим (маскированный ввод, без эха в буфер обмена по умолчанию).
+            ui.add(egui::TextEdit::multiline(&mut self.mnemonic_input).password(true));
         } else {
             ui.label("Ваш seed (запишите, показывается один раз):");
             egui::Frame::dark_canvas(ui.style()).show(ui, |ui| {
