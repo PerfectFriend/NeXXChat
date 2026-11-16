@@ -30,9 +30,9 @@ object RustCore {
     @JvmStatic
     external fun sha256Hex(data: String): String
 
-    /** PBKDF2-HMAC-SHA256 → hex ключа длиной dkLen байт. */
+    /** PBKDF2-HMAC-SHA256 → hex ключа. Параметры фиксированы в ядре (аудит H6), из JNI не приходят. */
     @JvmStatic
-    external fun pbkdf2Hex(password: String, saltHex: String, iterations: Int, dkLen: Int): String
+    external fun pbkdf2Hex(password: String, saltHex: String): String
 
     /** AES-256-GCM: keyHex(32 байта) + dataHex → hex(iv12 + ct + tag16) или {"error":...} */
     @JvmStatic
@@ -52,9 +52,9 @@ object RustCore {
     @JvmStatic
     external fun bip39Validate(wordsSpaceSeparated: String): Boolean
 
-    /** BIP39-style seed: PBKDF2(mnemonic, "mnemonic"+passphrase) → hex */
+    /** Legacy BIP39-вариант сидa (PBKDF2-HMAC-SHA256, фиксированные параметры, аудит H6). Для кошельков — bip39SeedStandardHex. */
     @JvmStatic
-    external fun bip39SeedHex(mnemonic: String, passphrase: String, iterations: Int, dkLen: Int): String
+    external fun bip39SeedHex(mnemonic: String, passphrase: String): String
 
     // ---- Control plane (фаза 4) ----
 
@@ -96,17 +96,27 @@ object RustCore {
     @JvmStatic
     external fun bip39SeedStandardHex(mnemonic: String, passphrase: String): String
 
-    /** 32-байтный ключ по метке (hex): derive_label(seedHex, label). */
-    @JvmStatic
-    external fun keyDeriveLabel(seedHex: String, label: String): String
+    // ---- Opaque seed handles (аудит H7: сид не ходит через JNI строкой на каждый вызов) ----
 
-    /** JSON {"ok","chain","index","path","address"} — адрес кошелька. */
+    /** long seedImport(seedHex) → handle > 0 (сид в Zeroize-хранилище) или -1 при ошибке. */
     @JvmStatic
-    external fun keyWallet(seedHex: String, chain: String, index: Int): String
+    external fun seedImport(seedHex: String): Long
 
-    /** JSON {"ok","nodes":[{index,id,identityKey,storageKey,chatKey}]} — план флота. */
+    /** boolean seedRelease(handle) — удаляет и затирает сид. */
     @JvmStatic
-    external fun keyFleetPlan(seedHex: String, nodeCount: Int): String
+    external fun seedRelease(handle: Long): Boolean
+
+    /** 32-байтный ключ по метке: derive_label(seed[handle], label), hex. */
+    @JvmStatic
+    external fun keyDeriveLabelByHandle(handle: Long, label: String): String
+
+    /** JSON {"ok","chain","index","path","address"} — адрес кошелька по handle сида. */
+    @JvmStatic
+    external fun keyWalletByHandle(handle: Long, chain: String, index: Int): String
+
+    /** JSON {"ok","nodes":[...]} — план флота по handle сида. */
+    @JvmStatic
+    external fun keyFleetPlanByHandle(handle: Long, nodeCount: Int): String
 
     /**
      * JSON {"ok","session","version"} — TLS-подключение к SMP-релею.

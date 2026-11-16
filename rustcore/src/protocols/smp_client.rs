@@ -321,7 +321,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
             .chain(intermediates.iter().map(|i| i.as_ref().to_vec()))
             .collect();
         validate_server_chain(end_entity.as_ref(), &chain, &self.expected_key_hash)
-            .map_err(|e| rustls::Error::General(e))?;
+            .map_err(rustls::Error::General)?;
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 

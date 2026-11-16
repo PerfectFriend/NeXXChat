@@ -7,6 +7,17 @@ use jni::JNIEnv;
 
 use crate::{bip39, crypto, keytree, proxy_parse};
 
+/// Аудит M8: верхние границы входов через JNI — защита от OOM/DoS
+/// (гигантский nBytes в randomHex, неограниченные строки/KDF-параметры).
+pub const MAX_INPUT_CHARS: usize = 4 << 20; // 4M chars на одну входную строку
+pub const MAX_RANDOM_BYTES: jni::sys::jint = 4096;
+pub const MAX_DATA_HEX_CHARS: usize = 32 << 20; // hex-вход AES-GCM (16 МБ данных)
+/// Аудит H6: KDF-параметры фиксированы в коде и НЕ приходят через JNI.
+pub const PBKDF2_ITERATIONS: u32 = 600_000;
+pub const PBKDF2_DKLEN: usize = 32;
+pub const BIP39_LEGACY_ITERATIONS: u32 = 2048;
+pub const BIP39_LEGACY_DKLEN: usize = 64;
+
 fn to_jstring(env: &mut JNIEnv, s: String) -> jstring {
     match env.new_string(s) {
         Ok(j) => j.into_raw(),
@@ -14,8 +25,37 @@ fn to_jstring(env: &mut JNIEnv, s: String) -> jstring {
     }
 }
 
-fn get_str(env: &mut JNIEnv, s: JString) -> String {
-    env.get_string(&s).map(|j| j.into()).unwrap_or_default()
+fn err_json(e: &str) -> String {
+    format!(
+        r#"{{"ok":false,"error":{}}}"#,
+        serde_json::to_string(e).unwrap_or_else(|_| "\"err\"".into())
+    )
+}
+
+/// Аудит M11: ошибка JNI get_string НЕ должна становиться silent empty string —
+/// она уходит наружу как JSON-ошибка. Также режем слишком длинные входы (M8).
+fn get_str(env: &mut JNIEnv, s: JString) -> Result<String, String> {
+    let out: String = env
+        .get_string(&s)
+        .map(|j| j.into())
+        .map_err(|e| format!("JNI get_string: {e}"))?;
+    if out.len() > MAX_INPUT_CHARS {
+        return Err(format!(
+            "input too large: {} chars (max {MAX_INPUT_CHARS})",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// jstr! — для функций, возвращающих jstring: ошибка уезжает как JSON-ошибка.
+macro_rules! jstr {
+    ($env:expr, $s:expr) => {
+        match get_str($env, $s) {
+            Ok(v) => v,
+            Err(e) => return to_jstring($env, err_json(&e)),
+        }
+    };
 }
 
 /// String parseProxyConfig(String input, String remarks) — JSON-результат парсера.
@@ -26,8 +66,8 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_parseProxyConfig(
     input: JString,
     remarks: JString,
 ) -> jstring {
-    let input = get_str(&mut env, input);
-    let remarks = get_str(&mut env, remarks);
+    let input = jstr!(&mut env, input);
+    let remarks = jstr!(&mut env, remarks);
     to_jstring(&mut env, proxy_parse::parse_proxy_config(&input, &remarks))
 }
 
@@ -38,24 +78,26 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_sha256Hex(
     _class: JClass,
     data: JString,
 ) -> jstring {
-    let s = get_str(&mut env, data);
+    let s = jstr!(&mut env, data);
     to_jstring(&mut env, crypto::sha256_hex(s.as_bytes()))
 }
 
-/// String pbkdf2Hex(String password, String saltHex, int iterations, int dkLen)
+/// String pbkdf2Hex(String password, String saltHex)
+/// Аудит H6: iterations/dkLen более НЕ принимаются из JNI — фиксированы константами.
 #[no_mangle]
 pub extern "system" fn Java_com_nexx_rustcore_RustCore_pbkdf2Hex(
     mut env: JNIEnv,
     _class: JClass,
     password: JString,
     salt_hex: JString,
-    iterations: jni::sys::jint,
-    dk_len: jni::sys::jint,
 ) -> jstring {
-    let pw = get_str(&mut env, password);
-    let salt_hex = get_str(&mut env, salt_hex);
-    let salt = hex_decode(&salt_hex).unwrap_or_default();
-    let dk = crypto::pbkdf2_hmac_sha256(pw.as_bytes(), &salt, iterations.max(1) as u32, dk_len.max(1) as usize);
+    let pw = jstr!(&mut env, password);
+    let salt_hex = jstr!(&mut env, salt_hex);
+    let salt = match crypto::hex_decode(&salt_hex) {
+        Some(s) if !s.is_empty() => s,
+        _ => return to_jstring(&mut env, err_json("saltHex: bad or empty hex")),
+    };
+    let dk = crypto::pbkdf2_hmac_sha256(pw.as_bytes(), &salt, PBKDF2_ITERATIONS, PBKDF2_DKLEN);
     to_jstring(&mut env, crypto::hex_encode(&dk))
 }
 
@@ -67,13 +109,16 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_aesGcmEncryptHex(
     key_hex: JString,
     data_hex: JString,
 ) -> jstring {
-    let key_hex = get_str(&mut env, key_hex);
-    let data_hex = get_str(&mut env, data_hex);
-    let key = match hex_decode(&key_hex) {
+    let key_hex = jstr!(&mut env, key_hex);
+    let data_hex = jstr!(&mut env, data_hex);
+    if data_hex.len() > MAX_DATA_HEX_CHARS {
+        return to_jstring(&mut env, err_json("data too large for AES-GCM input"));
+    }
+    let key = match crypto::hex_decode(&key_hex) {
         Some(k) if k.len() == 32 => k,
         _ => return to_jstring(&mut env, r#"{"error":"key must be 32 bytes hex"}"#.into()),
     };
-    let pt = match hex_decode(&data_hex) {
+    let pt = match crypto::hex_decode(&data_hex) {
         Some(d) => d,
         None => return to_jstring(&mut env, r#"{"error":"bad hex data"}"#.into()),
     };
@@ -91,13 +136,13 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_aesGcmDecryptHex(
     key_hex: JString,
     data_hex: JString,
 ) -> jstring {
-    let key_hex = get_str(&mut env, key_hex);
-    let data_hex = get_str(&mut env, data_hex);
-    let key = match hex_decode(&key_hex) {
+    let key_hex = jstr!(&mut env, key_hex);
+    let data_hex = jstr!(&mut env, data_hex);
+    let key = match crypto::hex_decode(&key_hex) {
         Some(k) if k.len() == 32 => k,
         _ => return to_jstring(&mut env, r#"{"error":"key must be 32 bytes hex"}"#.into()),
     };
-    let data = match hex_decode(&data_hex) {
+    let data = match crypto::hex_decode(&data_hex) {
         Some(d) => d,
         None => return to_jstring(&mut env, r#"{"error":"bad hex data"}"#.into()),
     };
@@ -107,14 +152,14 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_aesGcmDecryptHex(
     }
 }
 
-/// String randomHex(int nBytes)
+/// String randomHex(int nBytes) — nBytes кlampeруется в [0, MAX_RANDOM_BYTES] (аудит M8: без upper bound → OOM).
 #[no_mangle]
 pub extern "system" fn Java_com_nexx_rustcore_RustCore_randomHex(
     mut env: JNIEnv,
     _class: JClass,
     n: jni::sys::jint,
 ) -> jstring {
-    let bytes = crypto::random_bytes(n.max(0) as usize);
+    let bytes = crypto::random_bytes(n.clamp(0, MAX_RANDOM_BYTES) as usize);
     to_jstring(&mut env, crypto::hex_encode(&bytes))
 }
 
@@ -143,7 +188,10 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_bip39Validate(
     _class: JClass,
     words: JString,
 ) -> jni::sys::jboolean {
-    let s = get_str(&mut env, words);
+    let s = match get_str(&mut env, words) {
+        Ok(v) => v,
+        Err(_) => return 0, // ошибка чтения → false, не silent-empty
+    };
     let w: Vec<String> = s.split_whitespace().map(|x| x.to_string()).collect();
     if bip39::validate_mnemonic(&w) {
         1
@@ -152,20 +200,25 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_bip39Validate(
     }
 }
 
-/// String bip39SeedHex(String mnemonic, String passphrase, int iterations, int dkLen)
+/// String bip39SeedHex(String mnemonic, String passphrase)
+/// Legacy-вариант (PBKDF2-HMAC-SHA256); параметры фиксированы (аудит H6).
+/// Для переносимых кошельков — bip39SeedStandardHex (SHA512/2048).
 #[no_mangle]
 pub extern "system" fn Java_com_nexx_rustcore_RustCore_bip39SeedHex(
     mut env: JNIEnv,
     _class: JClass,
     mnemonic: JString,
     passphrase: JString,
-    iterations: jni::sys::jint,
-    dk_len: jni::sys::jint,
 ) -> jstring {
-    let m = get_str(&mut env, mnemonic);
-    let p = get_str(&mut env, passphrase);
+    let m = jstr!(&mut env, mnemonic);
+    let p = jstr!(&mut env, passphrase);
     let salt = format!("mnemonic{p}");
-    let dk = crypto::pbkdf2_hmac_sha256(m.as_bytes(), salt.as_bytes(), iterations.max(1) as u32, dk_len.max(1) as usize);
+    let dk = crypto::pbkdf2_hmac_sha256(
+        m.as_bytes(),
+        salt.as_bytes(),
+        BIP39_LEGACY_ITERATIONS,
+        BIP39_LEGACY_DKLEN,
+    );
     to_jstring(&mut env, crypto::hex_encode(&dk))
 }
 
@@ -178,46 +231,122 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_bip39SeedStandardHex(
     mnemonic: JString,
     passphrase: JString,
 ) -> jstring {
-    let m = get_str(&mut env, mnemonic);
-    let p = get_str(&mut env, passphrase);
+    let m = jstr!(&mut env, mnemonic);
+    let p = jstr!(&mut env, passphrase);
     let seed = bip39::seed_from_mnemonic_standard(&m, &p);
     to_jstring(&mut env, crypto::hex_encode(&seed))
 }
 
-/// String keyDeriveLabel(String seedHex, String label) → 32-байтный ключ (hex).
-/// Универсальный источник ключей: одна метка — один ключ, разные метки независимы.
+/// String version() — диагностика: версия библиотеки.
 #[no_mangle]
-pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyDeriveLabel(
+pub extern "system" fn Java_com_nexx_rustcore_RustCore_version(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    to_jstring(&mut env, format!("nexxrust {}", env!("CARGO_PKG_VERSION")))
+}
+
+// ---------- Opaque seed handles (аудит H7: сид не должен ходить через JNI строкой) ----------
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{LazyLock, Mutex};
+use zeroize::Zeroizing;
+
+static SEED_STORE: LazyLock<Mutex<HashMap<i64, Zeroizing<Vec<u8>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_SEED_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+fn seed_store_insert(seed: Vec<u8>) -> i64 {
+    let h = NEXT_SEED_HANDLE.fetch_add(1, Ordering::Relaxed);
+    SEED_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(h, Zeroizing::new(seed));
+    h
+}
+
+fn seed_store_get(handle: i64) -> Option<Vec<u8>> {
+    SEED_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&handle)
+        .map(|z| (**z).clone())
+}
+
+fn seed_store_remove(handle: i64) -> bool {
+    SEED_STORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle)
+        .is_some()
+}
+
+/// long seedImport(String seedHex) → handle (>0) или -1 при ошибке.
+/// Сид попадает в процесс один раз и далее живёт только под handle (Zeroize при release).
+#[no_mangle]
+pub extern "system" fn Java_com_nexx_rustcore_RustCore_seedImport(
     mut env: JNIEnv,
     _class: JClass,
     seed_hex: JString,
+) -> jni::sys::jlong {
+    let s = match get_str(&mut env, seed_hex) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    match crypto::hex_decode(&s) {
+        Some(seed) if (16..=128).contains(&seed.len()) => seed_store_insert(seed) as jni::sys::jlong,
+        _ => -1,
+    }
+}
+
+/// boolean seedRelease(long handle) — удаляет сид из памяти (ZeroizeOnDrop у Zeroizing).
+#[no_mangle]
+pub extern "system" fn Java_com_nexx_rustcore_RustCore_seedRelease(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jni::sys::jlong,
+) -> jni::sys::jboolean {
+    if seed_store_remove(handle) { 1 } else { 0 }
+}
+
+fn seed_or_err(env: &mut JNIEnv, handle: jni::sys::jlong) -> Result<Vec<u8>, jstring> {
+    match seed_store_get(handle) {
+        Some(s) => Ok(s),
+        None => Err(to_jstring(env, err_json("unknown seed handle"))),
+    }
+}
+
+/// String keyDeriveLabelByHandle(long handle, String label) → 32-байтный ключ (hex).
+#[no_mangle]
+pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyDeriveLabelByHandle(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jni::sys::jlong,
     label: JString,
 ) -> jstring {
-    let seed_hex = get_str(&mut env, seed_hex);
-    let label = get_str(&mut env, label);
-    let seed = match crypto::hex_decode(&seed_hex) {
-        Some(s) => s,
-        None => return to_jstring(&mut env, String::new()),
+    let label = jstr!(&mut env, label);
+    let seed = match seed_or_err(&mut env, handle) {
+        Ok(s) => s,
+        Err(j) => return j,
     };
     let key = keytree::derive_label(&seed, &label);
     to_jstring(&mut env, crypto::hex_encode(&key))
 }
 
-/// String keyWallet(String seedHex, String chain, int index) → JSON.
-/// chain: "eth" | "btc" | "sol" | "smp".
+/// String keyWalletByHandle(long handle, String chain, int index) → JSON.
 #[no_mangle]
-pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyWallet(
+pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyWalletByHandle(
     mut env: JNIEnv,
     _class: JClass,
-    seed_hex: JString,
+    handle: jni::sys::jlong,
     chain: JString,
     index: jni::sys::jint,
 ) -> jstring {
-    let seed_hex = get_str(&mut env, seed_hex);
-    let chain = get_str(&mut env, chain);
-    let seed = match crypto::hex_decode(&seed_hex) {
-        Some(s) => s,
-        None => return to_jstring(&mut env, r#"{"ok":false,"error":"bad seed hex"}"#.into()),
+    let chain = jstr!(&mut env, chain);
+    let seed = match seed_or_err(&mut env, handle) {
+        Ok(s) => s,
+        Err(j) => return j,
     };
     let idx = index.max(0) as u32;
     let (path, address) = match chain.as_str() {
@@ -241,14 +370,14 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyWallet(
             (p, addr)
         }
         "smp" => {
-            // SIMPLEX-идентичность: Ed25519 по SLIP-0010
             let p = format!("m/0'/0'/{idx}'");
             match keytree::derive_path_ed25519(&seed, &p) {
                 Some(k) => {
                     let sk = ed25519_dalek::SigningKey::from_bytes(&k.private);
                     let pub_b64 = {
                         use base64::Engine as _;
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.verifying_key().to_bytes())
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(sk.verifying_key().to_bytes())
                     };
                     (p, Some(format!("ed25519:{pub_b64}")))
                 }
@@ -267,19 +396,17 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyWallet(
     to_jstring(&mut env, json.to_string())
 }
 
-/// String keyFleetPlan(String seedHex, int nodeCount) → JSON.
-/// План флота нод из одного мастер-сида: id, ключи идентичности/хранилища/чата.
+/// String keyFleetPlanByHandle(long handle, int nodeCount) → JSON.
 #[no_mangle]
-pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyFleetPlan(
+pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyFleetPlanByHandle(
     mut env: JNIEnv,
     _class: JClass,
-    seed_hex: JString,
+    handle: jni::sys::jlong,
     node_count: jni::sys::jint,
 ) -> jstring {
-    let seed_hex = get_str(&mut env, seed_hex);
-    let seed = match crypto::hex_decode(&seed_hex) {
-        Some(s) => s,
-        None => return to_jstring(&mut env, r#"{"ok":false,"error":"bad seed hex"}"#.into()),
+    let seed = match seed_or_err(&mut env, handle) {
+        Ok(s) => s,
+        Err(j) => return j,
     };
     let count = node_count.clamp(0, 1000) as u32;
     let plan = keytree::plan_fleet(&seed, count);
@@ -299,28 +426,37 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyFleetPlan(
     to_jstring(&mut env, json.to_string())
 }
 
-/// String version() — диагностика: версия библиотеки.
-#[no_mangle]
-pub extern "system" fn Java_com_nexx_rustcore_RustCore_version(
-    mut env: JNIEnv,
-    _class: JClass,
-) -> jstring {
-    to_jstring(&mut env, format!("nexxrust {}", env!("CARGO_PKG_VERSION")))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    let b: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
-    if !b.len().is_multiple_of(2) {
-        return None;
+    #[test]
+    fn seed_handle_roundtrip_and_release() {
+        let h = seed_store_insert(vec![0xAB; 64]);
+        assert!(h > 0);
+        assert_eq!(seed_store_get(h), Some(vec![0xAB; 64]));
+        assert!(seed_store_remove(h));
+        assert!(seed_store_get(h).is_none());
+        assert!(!seed_store_remove(h)); // повторный release → false
     }
-    (0..b.len())
-        .step_by(2)
-        .map(|i| {
-            let hi = (b[i] as char).to_digit(16)?;
-            let lo = (b[i + 1] as char).to_digit(16)?;
-            Some((hi * 16 + lo) as u8)
-        })
-        .collect()
+
+    #[test]
+    fn seed_handles_are_unique_and_isolated() {
+        let a = seed_store_insert(vec![1; 32]);
+        let b = seed_store_insert(vec![2; 32]);
+        assert_ne!(a, b);
+        assert_eq!(seed_store_get(a), Some(vec![1; 32]));
+        assert_eq!(seed_store_get(b), Some(vec![2; 32]));
+        seed_store_remove(a);
+        seed_store_remove(b);
+    }
+
+    #[test]
+    fn random_hex_upper_bound() {
+        assert_eq!(MAX_RANDOM_BYTES, 4096);
+        assert_eq!(i32::MAX.clamp(0, MAX_RANDOM_BYTES), 4096);
+        assert_eq!((-5).clamp(0, MAX_RANDOM_BYTES), 0);
+    }
 }
 
 // ---------- Control plane (фаза 4) ----------
@@ -334,7 +470,10 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_portAllocAcquire(
     start: jni::sys::jint,
     end: jni::sys::jint,
 ) -> jni::sys::jlong {
-    let lf = get_str(&mut env, lock_file);
+    let lf = match get_str(&mut env, lock_file) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
     crate::control::port_alloc_acquire(&lf, start.max(1) as u16, end.min(65535) as u16) as jni::sys::jlong
 }
 
@@ -346,7 +485,10 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_portAllocRelease(
     lock_file: JString,
     port: jni::sys::jint,
 ) -> jni::sys::jboolean {
-    let lf = get_str(&mut env, lock_file);
+    let lf = match get_str(&mut env, lock_file) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
     if crate::control::port_alloc_release(&lf, port.max(0) as u16) { 1 } else { 0 }
 }
 
@@ -359,7 +501,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_healthCheckTcp(
     port: jni::sys::jint,
     timeout_ms: jni::sys::jint,
 ) -> jstring {
-    let h = get_str(&mut env, host);
+    let h = jstr!(&mut env, host);
     to_jstring(&mut env, crate::control::health_check_tcp(&h, port.max(1) as u16, timeout_ms.max(1) as u32).to_string())
 }
 
@@ -374,8 +516,8 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_healthCheckSocks5(
     target_port: jni::sys::jint,
     timeout_ms: jni::sys::jint,
 ) -> jstring {
-    let ph = get_str(&mut env, proxy_host);
-    let th = get_str(&mut env, target_host);
+    let ph = jstr!(&mut env, proxy_host);
+    let th = jstr!(&mut env, target_host);
     to_jstring(&mut env, crate::control::health_check_socks5(
         &ph,
         proxy_port.max(1) as u16,
@@ -394,8 +536,8 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_buildXrayMergedConfig(
     local_port: jni::sys::jint,
     protocol_hint: JString,
 ) -> jstring {
-    let uc = get_str(&mut env, user_config);
-    let ph = get_str(&mut env, protocol_hint);
+    let uc = jstr!(&mut env, user_config);
+    let ph = jstr!(&mut env, protocol_hint);
     to_jstring(&mut env, crate::control::build_xray_merged_config(&uc, local_port.max(1) as u16, &ph).to_string())
 }
 
@@ -408,7 +550,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_torControlBootstrapProgre
     port: jni::sys::jint,
     timeout_ms: jni::sys::jint,
 ) -> jstring {
-    let h = get_str(&mut env, host);
+    let h = jstr!(&mut env, host);
     to_jstring(&mut env, crate::control::tor_control_bootstrap_progress(&h, port.max(1) as u16, timeout_ms.max(1) as u32).to_string())
 }
 
@@ -443,10 +585,10 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_buildSsLink(
     port: jni::sys::jint,
     tag: JString,
 ) -> jstring {
-    let m = get_str(&mut env, method);
-    let p = get_str(&mut env, password);
-    let h = get_str(&mut env, host);
-    let t = get_str(&mut env, tag);
+    let m = jstr!(&mut env, method);
+    let p = jstr!(&mut env, password);
+    let h = jstr!(&mut env, host);
+    let t = jstr!(&mut env, tag);
     to_jstring(&mut env, crate::control::build_ss_link(&m, &p, &h, port.max(1) as u16, &t))
 }
 
@@ -457,6 +599,6 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_parseSsLink(
     _class: JClass,
     link: JString,
 ) -> jstring {
-    let l = get_str(&mut env, link);
+    let l = jstr!(&mut env, link);
     to_jstring(&mut env, crate::control::parse_ss_link(&l).to_string())
 }

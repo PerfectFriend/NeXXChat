@@ -6,7 +6,9 @@ set -u
 cd "$(dirname "$0")/.."
 
 HOST=${1:-smp6.simplex.im:5223}
-CA=${CA_PEM_FILE:-/home/thomas/.hermes/cache/scratch/smp6-5223-chain.pem}
+# CA-цепочка живёт в репозитории (assets/), НЕ в scratch — scratch чистится через 24 ч
+# и сборка/прогон молча падает (ловушка: include_str! / CA_PEM_FILE из scratch).
+CA=${CA_PEM_FILE:-"$(cd "$(dirname "$0")/.." && pwd)/assets/smp6-5223-chain.pem"}
 BIN=${CARGO_TARGET_DIR:-/home/thomas/build/cache/cargo-target}/release
 export NEXX_TLS=openssl
 

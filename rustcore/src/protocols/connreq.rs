@@ -133,7 +133,7 @@ pub fn decode_conn_req(d: &[u8]) -> Result<ConnReqData, String> {
         let queue_mode = *d.get(p).ok_or("queueMode: EOF")?;
         p += 1;
         // Аудит H3: никаких паник на внешних данных (инвайт-URI) — hosts_n==0 даёт ошибку.
-        let host = hosts.get(0).cloned().ok_or("smpQueueUri: пустой список хостов")?;
+        let host = hosts.first().cloned().ok_or("smpQueueUri: пустой список хостов")?;
         queues.push(SmpQueueUri {
             smp_v_min, smp_v_max,
             host,
