@@ -151,19 +151,33 @@ pub fn derive_ed25519(parent: &XKey, index: u32) -> Option<XKey> {
 }
 
 /// Путь в стиле `m/44'/60'/0'/0/0`. Разбор: `44'`, `60`, `0'` и т.п.
+/// Аудит M10: только ASCII-цифры; hardened-индекс обязан быть < 2^31
+/// (иначе `n + 0x8000_0000` переполняет u32 и молча даёт чужой индекс).
 pub fn parse_path(path: &str) -> Option<Vec<u32>> {
     let mut out = Vec::new();
     for part in path.split('/') {
         let part = part.trim();
-        if part.is_empty() || part == "m" {
+        if part.is_empty() || part.eq_ignore_ascii_case("m") {
             continue;
         }
-        let (num, hardened) = match part.strip_suffix('\'').or_else(|| part.strip_suffix('h')) {
+        let (num, hardened) = match part
+            .strip_suffix('\'')
+            .or_else(|| part.strip_suffix('h'))
+            .or_else(|| part.strip_suffix('H'))
+        {
             Some(n) => (n, true),
             None => (part, false),
         };
+        // M10: только цифры — '+', '_' и т.п. отклоняем (u32::parse принимает '+').
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
         let n: u32 = num.parse().ok()?;
-        out.push(if hardened { n + 0x8000_0000 } else { n });
+        if hardened {
+            out.push(n.checked_add(0x8000_0000)?); // None при n ≥ 2^31
+        } else {
+            out.push(n);
+        }
     }
     Some(out)
 }
@@ -315,6 +329,13 @@ pub fn sol_address(seed: &[u8], path: &str) -> Option<String> {
     Some(bs58::encode(signing.verifying_key().to_bytes()).into_string())
 }
 
+/// Домен-разделённый подсид (аудит M9): HMAC-SHA256(key=seed, msg=domain).
+/// wallet / fleet / proxy получают **независимые** подсиды от одного мастер-сида —
+/// компрометация одного домена не тянет остальные.
+pub fn subseed(seed: &[u8], domain: &str) -> Vec<u8> {
+    crate::crypto::hmac_sha256(seed, format!("nexx-subseed-v1:{domain}").as_bytes())
+}
+
 /// Ключ по строковой метке через HKDF-Expand от мастер-сида (domain separation).
 ///
 /// Метка — единственный вход: `"smp/identity"`, `"node/0/storage"`, `"wallet/eth/0"` и т.п.
@@ -325,6 +346,13 @@ pub fn derive_label(seed: &[u8], label: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&okm);
     out
+}
+
+/// Ключ по метке **внутри домена** (M9): сначала subseed(domain), потом derive_label.
+/// Используется для fleet/proxy — домены изолированы от кошелькового сида.
+pub fn derive_label_domain(seed: &[u8], domain: &str, label: &str) -> [u8; 32] {
+    let sub = subseed(seed, domain);
+    derive_label(&sub, label)
 }
 
 /// Идентификатор узла флота: 16 байт = SHA-256(pubkey)[:16] — стабильный, не секретный.
@@ -349,13 +377,16 @@ pub struct NodePlan {
 }
 
 /// Собирает план флота из N нод на одном мастер-сиде.
+/// Аудит M9: весь флот живёт в домене "fleet" (subseed), изолированном
+/// от кошелькового и прокси-доменов — один сид, но независимые ключи.
 pub fn plan_fleet(seed: &[u8], node_count: u32) -> Vec<NodePlan> {
+    let sub = subseed(seed, "fleet");
     (0..node_count)
         .map(|i| {
-            let id = node_id(seed, i);
-            let identity = derive_label(seed, &format!("node/{i}/identity"));
-            let storage = derive_label(seed, &format!("node/{i}/storage"));
-            let chat = derive_label(seed, &format!("node/{i}/chat"));
+            let id = node_id(&sub, i);
+            let identity = derive_label(&sub, &format!("node/{i}/identity"));
+            let storage = derive_label(&sub, &format!("node/{i}/storage"));
+            let chat = derive_label(&sub, &format!("node/{i}/chat"));
             NodePlan {
                 index: i,
                 id: id.iter().map(|b| format!("{b:02x}")).collect(),
@@ -553,6 +584,46 @@ mod tests {
         let a2 = derive_label(&seed, "smp/identity");
         assert_eq!(a, a2);
         assert_ne!(a, b);
+    }
+
+    /// Аудит M9: домены (fleet/wallet/proxy) от одного сида дают независимые ключи.
+    #[test]
+    fn m9_domain_subseeds_are_independent() {
+        let seed = [21u8; 32];
+        let fleet_k = derive_label_domain(&seed, "fleet", "node/0/chat");
+        let proxy_k = derive_label_domain(&seed, "proxy", "node/0/chat");
+        let wallet_k = derive_label(&seed, "node/0/chat"); // кошелёк — без домена
+        assert_ne!(fleet_k, proxy_k);
+        assert_ne!(fleet_k, wallet_k);
+        assert_ne!(proxy_k, wallet_k);
+        // subseed детерминирован
+        assert_eq!(subseed(&seed, "fleet"), subseed(&seed, "fleet"));
+        assert_ne!(subseed(&seed, "fleet"), subseed(&seed, "proxy"));
+        // план флота не пересекается с прямыми метками мастер-сида
+        let p = plan_fleet(&seed, 3);
+        assert_ne!(p[0].chat_key, hex(&derive_label(&seed, "node/0/chat")));
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Аудит M10: parse_path отклоняет hardened ≥ 2^31 (было переполнение u32),
+    /// нецифровые сегменты ('+', '_', пустые после суффикса).
+    #[test]
+    fn m10_parse_path_edge_cases() {
+        assert_eq!(parse_path("m/44'/60'/0'/0/0"), Some(vec![44 + 0x8000_0000, 60 + 0x8000_0000, 0x8000_0000, 0, 0]));
+        assert_eq!(parse_path("m/0h"), Some(vec![0x8000_0000]));
+        // hardened ≥ 2^31 → None (раньше: wrap-around в чужой индекс)
+        assert_eq!(parse_path("m/2147483648'"), None);
+        assert_eq!(parse_path("m/4294967295'"), None);
+        // нецифры
+        assert_eq!(parse_path("m/+5"), None);
+        assert_eq!(parse_path("m/5x"), None);
+        assert_eq!(parse_path("m/'"), None);
+        assert_eq!(parse_path("m/99999999999999999999"), None); // > u32
+        // валидный обычный индекс до 2^31-1
+        assert_eq!(parse_path("m/2147483647"), Some(vec![2147483647]));
     }
 
     /// План флота: N нод из одного сида, id разные, детерминированные.

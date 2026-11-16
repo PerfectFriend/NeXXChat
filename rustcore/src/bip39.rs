@@ -107,14 +107,36 @@ pub fn validate_mnemonic(words: &[String]) -> bool {
     true
 }
 
-/// Хеш фразы для хранения (как hashSeedPhrase в Kotlin): sha256 hex от "w1 w2 ...".
-pub fn hash_seed_phrase(words: &[String]) -> String {
-    crate::crypto::sha256_hex(words.join(" ").as_bytes())
+/// Хеш фразы для хранения (аудит M7): PBKDF2-HMAC-SHA256 с **персональной солью**,
+/// 600 000 итераций — вместо голого SHA-256 (rainbow-table уязвимость).
+/// Соль генерируется приложением на устройство и хранится рядом с хешем.
+/// Детерминирован: одинаковые (words, salt) → одинаковый хеш.
+pub fn hash_seed_phrase(words: &[String], salt: &[u8]) -> String {
+    const ITERATIONS: u32 = 600_000;
+    // Domain separator, чтобы хеш нельзя было спутать с другими KDF-выходами.
+    let mut salted = b"nexx:seed-hash:v1:".to_vec();
+    salted.extend_from_slice(salt);
+    let dk = crate::crypto::pbkdf2_hmac_sha256(words.join(" ").as_bytes(), &salted, ITERATIONS, 32);
+    crate::crypto::hex_encode(&dk)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Аудит M7: хеш фразы — salted KDF; разные соли → разные хеши,
+    /// одинаковая соль — детерминированный результат. Не голый SHA-256.
+    #[test]
+    fn m7_seed_hash_is_salted_kdf() {
+        let words: Vec<String> = vec!["abandon"; 12].iter().map(|s| s.to_string()).collect();
+        let h1 = hash_seed_phrase(&words, b"salt-A");
+        let h2 = hash_seed_phrase(&words, b"salt-A");
+        let h3 = hash_seed_phrase(&words, b"salt-B");
+        assert_eq!(h1, h2, "детерминирован при той же соли");
+        assert_ne!(h1, h3, "соль меняет хеш");
+        assert_ne!(h1, crate::crypto::sha256_hex(words.join(" ").as_bytes()), "не голый SHA-256");
+        assert_eq!(h1.len(), 64, "hex от 32 байт");
+    }
 
     #[test]
     fn zero_entropy_12_words() {
