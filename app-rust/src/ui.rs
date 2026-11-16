@@ -12,12 +12,16 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 /// CA-цепочка публичных SMP-релеев перенесена в `servers.rs` (аудит M6).
 
+/// Каталог данных приложения (Android private dir / XDG fallback).
+fn data_dir() -> String {
+    std::env::var("ANDROID_APP_PRIVATE_DIR")
+        .or_else(|_| std::env::var("XDG_DATA_HOME").map(|d| format!("{d}/nexx")))
+        .unwrap_or_else(|_| "/data/data/chat.nexx.app/files".to_string())
+}
+
 /// Путь зашифрованного хранилища очередей (стандартная директория данных приложения).
 fn queue_store_path() -> String {
-    let base = std::env::var("ANDROID_APP_PRIVATE_DIR")
-        .or_else(|_| std::env::var("XDG_DATA_HOME").map(|d| format!("{d}/nexx")))
-        .unwrap_or_else(|_| "/data/data/chat.nexx.app/files".to_string());
-    format!("{base}/queues.bin")
+    format!("{}/queues.bin", data_dir())
 }
 
 enum WorkerCmd {
@@ -242,6 +246,12 @@ pub struct NeXXUi {
     chat_input: String,
     chat_tx: Option<Sender<WorkerCmd>>,
     chat_rx: Option<Receiver<ChatEvent>>,
+    // контакты (Этап 2.2)
+    seed: Vec<u8>,
+    contacts: Vec<nexxrust::protocols::contact_store::ContactRecord>,
+    invite_input: String,
+    contact_name: String,
+    contacts_status: String,
 }
 
 enum Phase {
@@ -252,6 +262,7 @@ enum Phase {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Chats,
+    Contacts,
     Wallet,
     Fleet,
 }
@@ -278,6 +289,11 @@ impl NeXXUi {
             chat_input: String::new(),
             chat_tx: None,
             chat_rx: None,
+            seed: vec![],
+            contacts: vec![],
+            invite_input: String::new(),
+            contact_name: String::new(),
+            contacts_status: String::new(),
         }
     }
 
@@ -333,6 +349,8 @@ impl NeXXUi {
                     if bip39::validate_mnemonic(&self.mnemonic) {
                         let seed = bip39::seed_from_mnemonic_standard(&m, "");
                         self.seed_hex = crypto::hex_encode(&seed);
+                        self.seed = seed.clone();
+                        self.load_contacts();
                         self.fleet = keytree::plan_fleet(&seed, 5);
                         self.node_status = vec![String::new(); self.fleet.len()];
                         self.node_host = vec!["127.0.0.1".to_string(); self.fleet.len()];
@@ -352,15 +370,104 @@ impl NeXXUi {
     fn main(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Chats, "💬 Чаты");
+            ui.selectable_value(&mut self.tab, Tab::Contacts, "👤 Контакты");
             ui.selectable_value(&mut self.tab, Tab::Wallet, "💰 Кошелёк");
             ui.selectable_value(&mut self.tab, Tab::Fleet, "🖥️ Флот нод");
         });
         ui.separator();
         match self.tab {
             Tab::Chats => self.chats(ui, ctx),
+            Tab::Contacts => self.contacts_ui(ui),
             Tab::Wallet => self.wallet(ui),
             Tab::Fleet => self.fleet(ui),
         }
+    }
+
+    /// Вкладка «Контакты» (Этап 2.2): список из шифрованного contact_store +
+    /// добавление по инвайт-ссылке (connReq URI). Обмен очередями — invite_flow.
+    fn contacts_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("👤 Контакты");
+        if self.contacts.is_empty() {
+            ui.label("Пока пусто. Добавьте контакт по инвайт-ссылке ниже.");
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for c in &self.contacts {
+                ui.horizontal(|ui| {
+                    ui.label(format!("👤 {}  ({}:{})", c.name, c.host, c.port));
+                });
+            }
+        });
+        ui.separator();
+        ui.label("Добавить контакт по ссылке:");
+        ui.text_edit_singleline(&mut self.contact_name);
+        ui.add(egui::TextEdit::multiline(&mut self.invite_input).desired_rows(2));
+        if ui.button("➕ Добавить").clicked() {
+            match self.add_contact_from_invite() {
+                Ok(name) => {
+                    self.contacts_status = format!("✅ контакт {name} добавлен");
+                    self.invite_input.clear();
+                    self.contact_name.clear();
+                }
+                Err(e) => self.contacts_status = format!("⚠ {e}"),
+            }
+        }
+        if !self.contacts_status.is_empty() {
+            ui.colored_label(egui::Color32::LIGHT_GREEN, &self.contacts_status);
+        }
+    }
+
+    fn load_contacts(&mut self) {
+        if self.seed.is_empty() {
+            return;
+        }
+        let path = std::path::PathBuf::from(format!("{}/contacts.bin", data_dir()));
+        match nexxrust::protocols::contact_store::ContactStore::open(&path, &self.seed) {
+            Ok(st) => self.contacts = st.contacts().to_vec(),
+            Err(e) => self.contacts_status = format!("⚠ contact store: {e}"),
+        }
+    }
+
+    /// Парсит инвайт-ссылку, валидирует релей по конфигу (M6), сохраняет контакт.
+    fn add_contact_from_invite(&mut self) -> Result<String, String> {
+        use nexxrust::protocols::connreq;
+        use nexxrust::protocols::contact_store::{ContactRecord, ContactStore};
+        let uri = self.invite_input.trim().to_string();
+        if uri.is_empty() {
+            return Err("пустая ссылка".into());
+        }
+        let cr = connreq::decode_invite_uri(&uri).map_err(|e| format!("невалидная ссылка: {e}"))?;
+        let q = cr.queues.first().ok_or("в ссылке нет очередей")?;
+        // M6: релей из ссылки должен быть в конфиге, иначе отказ (не чужой CA)
+        if crate::servers::find(&q.host, q.port).is_none() {
+            return Err(format!("неизвестный релей {}:{} — добавьте в servers.rs", q.host, q.port));
+        }
+        let name = if self.contact_name.trim().is_empty() {
+            format!("contact-{}", &crypto::hex_encode(&q.sender_id)[..8])
+        } else {
+            self.contact_name.trim().to_string()
+        };
+        let peer_pub_hex = crypto::hex_encode(&q.dh_x509);
+        let id = ContactStore::id_for_peer_pub(&peer_pub_hex)?;
+        let rec = ContactRecord {
+            id: id.clone(),
+            name: name.clone(),
+            my_queue_label: format!("contact@{id}@{}:{}", q.host, q.port),
+            peer_rcv_id: crypto::hex_encode(&q.sender_id),
+            peer_snd_id: String::new(), // заполнится после обмена очередями (QADD)
+            host: q.host.clone(),
+            port: q.port,
+            peer_pub: peer_pub_hex,
+            conn_req: uri,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        let path = std::path::PathBuf::from(format!("{}/contacts.bin", data_dir()));
+        let mut st = ContactStore::open(&path, &self.seed).map_err(|e| e)?;
+        st.upsert(rec).map_err(|e| e)?;
+        self.contacts = st.contacts().to_vec();
+        Ok(name)
     }
 
     /// Двухпанельный чат как в Telegram: слева список, справа переписка + ввод снизу.

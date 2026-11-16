@@ -136,13 +136,17 @@ pub fn validate_contact(c: &ContactRecord) -> Result<(), String> {
     if c.my_queue_label.is_empty() {
         return Err("contact my_queue_label пустой".into());
     }
-    for (field, val) in [("peer_rcv_id", &c.peer_rcv_id), ("peer_snd_id", &c.peer_snd_id), ("peer_pub", &c.peer_pub)] {
+    for (field, val) in [("peer_rcv_id", &c.peer_rcv_id), ("peer_pub", &c.peer_pub)] {
         if val.is_empty() {
             return Err(format!("contact {field} пустой"));
         }
         if crate::crypto::hex_decode(val).is_none() {
             return Err(format!("contact {field} не hex"));
         }
+    }
+    // peer_snd_id может быть пустым до обмена очередями (QADD) — тогда не hex-проверяем
+    if !c.peer_snd_id.is_empty() && crate::crypto::hex_decode(&c.peer_snd_id).is_none() {
+        return Err("contact peer_snd_id не hex".into());
     }
     if c.host.is_empty() || c.port == 0 {
         return Err("contact host/port пустые".into());
