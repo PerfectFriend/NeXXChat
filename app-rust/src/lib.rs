@@ -13,6 +13,7 @@ use std::sync::Arc;
 use winit::event_loop::EventLoop;
 use winit::platform::android::EventLoopBuilderExtAndroid;
 
+mod servers;
 mod ui;
 
 fn configure_surface(
@@ -143,6 +144,13 @@ fn android_main(android_app: AndroidApp) {
         default_hook(info);
     }));
     log::info!("NeXX rust app start");
+
+    // Аудит M4: FLAG_SECURE — запрет скриншотов/записи экрана окна приложения
+    // (на экране может быть seed-фраза и приватные данные).
+    android_app.set_window_flags(
+        android_activity::WindowManagerFlags::SECURE,
+        android_activity::WindowManagerFlags::empty(),
+    );
 
     let event_loop = EventLoop::builder()
         .with_android_app(android_app)

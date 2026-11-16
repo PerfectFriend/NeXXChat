@@ -10,31 +10,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-/// CA-цепочка публичных SMP-релеев SimpleX (публичные сертификаты, пиннинг как в smp_smoke).
-const SMP_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBwjCCAUKgAwIBAgIUJIHRXfsIlUWgHKVAYWnhd0ghJMgwBQYDK2VxMCoxFjAU
-BgNVBAMMDVNNUCBzZXJ2ZXIgQ0ExEDAOBgNVBAoMB1NpbXBsZVgwIBcNMjYwMTA1
-MDkzMzQ5WhgPNDc2MzEyMDIwOTMzNDlaMBoxGDAWBgNVBAMMD3NtcDYuc2ltcGxl
-eC5pbTBDMAUGAytlcQM6AD51xMggRBOdV2mGLTTrrVPgDk5lKXjSdLvVH4XJd0qc
-fVGrJiwV5W/ZUZG+wmX7LzRMC37oS/0xAKNvMG0wCQYDVR0TBAIwADALBgNVHQ8E
-BAMCA8gwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFCb01tgTLSY1/tqO
-WoAahpSKY2TNMB8GA1UdIwQYMBaAFKwAnLeCqJPRrZZpDIJ9MnZSOp3nMAUGAytl
-cQNzAOQ7FbPs6IzPSNUxZ7QLtzG5Nb/60rzi73vEa8sZu9kn/F8uE8OiWd15qs+V
-fVOWOsPjPDd7zT0mAMgSxdJJ7vtnR7kejsA3bNqAr+zfX3k3mHzkKsCtxjht4EcR
-tpLCTwm7NSk9HSgWsMfzJQB2vicPAA==
------END CERTIFICATE-----
------BEGIN CERTIFICATE-----
-MIIBtjCCATagAwIBAgIUUyW5oE/0cm3BhQUtU1poneSoxvgwBQYDK2VxMCoxFjAU
-BgNVBAMMDVNNUCBzZXJ2ZXIgQ0ExEDAOBgNVBAoMB1NpbXBsZVgwIBcNMjIwMTEy
-MTE0ODUwWhgPNDc1OTEyMDkxMTQ4NTBaMCoxFjAUBgNVBAMMDVNNUCBzZXJ2ZXIg
-Q0ExEDAOBgNVBAoMB1NpbXBsZVgwQzAFBgMrZXEDOgA9fWFWCQZmSm07M0LyYJ8a
-PnAZBv/vy+rZrLPG7dQ9xTFKpCrIZA8X2gzQCdyaGQVvZsE/zgcq7YCjUzBRMB0G
-A1UdDgQWBBSsAJy3gqiT0a2WaQyCfTJ2Ujqd5zAfBgNVHSMEGDAWgBSsAJy3gqiT
-0a2WaQyCfTJ2Ujqd5zAPBgNVHRMBAf8EBTADAQH/MAUGAytlcQNzAM+etlcjuA4R
-DfYAQmYwtYptS3IrzQ5QVjEG7sOx/tPVJyKE1gYJviquIKJml2dJLshf5kY58DH/
-gNmbtPkDMwoWl/2g0NKyY/UA4qOLVNxQtiW8cMR+bGpGaUuupdL19xygH5lhftuc
-UjjdUuav0c4jAA==
------END CERTIFICATE-----";
+/// CA-цепочка публичных SMP-релеев перенесена в `servers.rs` (аудит M6).
 
 /// Путь зашифрованного хранилища очередей (стандартная директория данных приложения).
 fn queue_store_path() -> String {
@@ -65,138 +41,183 @@ struct ChatMsg {
 fn chat_worker(
     host: String,
     port: u16,
+    ca_pem: &'static str,
     seed: Vec<u8>,
     ev: Sender<ChatEvent>,
     cmd: Receiver<WorkerCmd>,
 ) {
     let say = |e: ChatEvent| { let _ = ev.send(e); };
-    say(ChatEvent::Status("TLS connect…".into()));
-    let mut client = match SmpClient::connect_openssl_with_ca(&host, port, Some(SMP_CA_PEM)) {
-        Ok(c) => c,
-        Err(e) => return say(ChatEvent::Err(format!("connect: {e}"))),
-    };
-    // Неблокирующий poll: иначе recv_transmissions ждёт до 60 с и команды Send из UI встают в очередь.
-    client.set_read_timeout(Some(Duration::from_millis(400)));
-    // Аудит H5: у каждой очереди — свой индекс и свои ключи (раньше все очереди
-    // использовали m/0'/0'/0' и m/0'/0'/1' — одна идентичность на все серверы).
-    // Реквизиты очереди сохраняются в зашифрованное хранилище, чтобы после
-    // перезапуска можно было восстановить очередь, а не плодить новые.
-    let store_path = std::path::PathBuf::from(queue_store_path());
-    let mut store = match queue_store::QueueStore::open(&store_path, &seed) {
-        Ok(st) => st,
-        Err(e) => return say(ChatEvent::Err(format!("queue store: {e}"))),
-    };
-    let label = format!("self@{host}:{port}");
-    let index = store.find_by_label(&label).map(|r| r.index).unwrap_or_else(|| store.next_index());
-    let keys = match queue_store::derive_queue_keys(&seed, index) {
-        Ok(k) => k,
-        Err(e) => return say(ChatEvent::Err(format!("derive queue keys: {e}"))),
-    };
-    let auth = keys.auth;
-    let dh = keys.dh;
-    say(ChatEvent::Status("NEW queue…".into()));
-    let ids = match client.create_queue(&smp::RecipientKeys { auth_signing: auth.clone(), dh_secret: dh.clone() }) {
-        Ok(i) => i,
-        Err(e) => return say(ChatEvent::Err(format!("NEW: {e}"))),
-    };
-    // Сохраняем реквизиты очереди (шифрованное хранилище) — H5.
-    if let Err(e) = store.upsert(queue_store::QueueRecord {
-        index,
-        rcv_id: crypto::hex_encode(&ids.rcv_id),
-        snd_id: crypto::hex_encode(&ids.snd_id),
-        label: label.clone(),
-        host: host.clone(),
-        port,
-    }) {
-        say(ChatEvent::Err(format!("queue store save: {e}")));
-    }
-    let eph_bytes: [u8; 32] = crypto::random_bytes(32).try_into().unwrap();
-    let eph = StaticSecret::from(eph_bytes);
-    let eph_pub_x509 = smp::x25519_x509(X25519Public::from(&eph).as_bytes());
-    let e2e = eph.diffie_hellman(&X25519Public::from(&dh));
-    let srv_pub = match smp::parse_x25519_x509(&ids.srv_dh_x509) {
-        Some(p) => p,
-        None => return say(ChatEvent::Err("bad srv dh key".into())),
-    };
-    let srv = dh.diffie_hellman(&X25519Public::from(srv_pub));
-    // SUB — чтобы сервер пушил MSG без ручного GET
-    if let Err(e) = client.subscribe(&ids.rcv_id, &auth) {
-        say(ChatEvent::Err(format!("SUB: {e}")));
-    }
-    say(ChatEvent::Ready(crypto::hex_encode(&ids.rcv_id)));
-
-    loop {
-        // сначала pending (wait_response складывает входящие MSG туда)
-        let mut pending = client.take_pending();
-        for c in pending.drain(..) {
-            if let Ok(m) = smp::parse_msg(&c) {
-                if let Ok(rcv) = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body) {
-                    if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
-                        if let Ok((_ph2, body)) = smp::parse_priv_header(&plain) {
-                            say(ChatEvent::Incoming(String::from_utf8_lossy(body).to_string()));
-                        }
-                    }
-                }
-                let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
+    // Аудит M3: reconnect с экспоненциальным backoff — соединение не должно
+    // умирать навсегда после одного сетевого сбоя.
+    let mut backoff = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    'reconnect: loop {
+        say(ChatEvent::Status("TLS connect…".into()));
+        let mut client = match SmpClient::connect_openssl_with_ca(&host, port, Some(ca_pem)) {
+            Ok(c) => {
+                backoff = Duration::from_secs(1); // успех — сброс backoff
+                c
             }
-        }
-        // команды из UI
-        while let Ok(c) = cmd.try_recv() {
-            match c {
-                WorkerCmd::Send(text) => {
-                    // ClientMessage = PrivHeader('_') + текст
-                    let mut body = vec![b'_'];
-                    body.extend_from_slice(text.as_bytes());
-                    match client.send_message(&ids.snd_id, e2e.as_bytes(), Some(&eph_pub_x509), &body, b"") {
-                        Ok(_) => say(ChatEvent::SentOk),
-                        Err(e) => say(ChatEvent::Err(format!("SEND: {e}"))),
-                    }
-                }
-                WorkerCmd::Quit => {
-                    // Аудит H5: при закрытии удаляем очередь на сервере (DEL),
-                    // чтобы на релее не оставались наши идентификаторы.
-                    if let Err(e) = client.delete_queue(&ids.rcv_id, &auth) {
-                        say(ChatEvent::Err(format!("DEL queue: {e}")));
-                    }
-                    let _ = store.remove(&label);
+            Err(e) => {
+                say(ChatEvent::Err(format!("connect: {e} — retry in {:?}", backoff)));
+                // Quit во время backoff — выходим сразу
+                if let Ok(WorkerCmd::Quit) = cmd.try_recv() {
                     return;
                 }
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                continue 'reconnect;
             }
+        };
+        // Неблокирующий poll: иначе recv_transmissions ждёт до 60 с и команды Send из UI встают в очередь.
+        client.set_read_timeout(Some(Duration::from_millis(400)));
+        // Аудит H5: у каждой очереди — свой индекс и свои ключи (раньше все очереди
+        // использовали m/0'/0'/0' и m/0'/0'/1' — одна идентичность на все серверы).
+        // Реквизиты очереди сохраняются в зашифрованное хранилище, чтобы после
+        // перезапуска можно было восстановить очередь, а не плодить новые.
+        let store_path = std::path::PathBuf::from(queue_store_path());
+        let mut store = match queue_store::QueueStore::open(&store_path, &seed) {
+            Ok(st) => st,
+            Err(e) => {
+                say(ChatEvent::Err(format!("queue store: {e}")));
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                continue 'reconnect;
+            }
+        };
+        let label = format!("self@{host}:{port}");
+        let index = store.find_by_label(&label).map(|r| r.index).unwrap_or_else(|| store.next_index());
+        let keys = match queue_store::derive_queue_keys(&seed, index) {
+            Ok(k) => k,
+            Err(e) => {
+                say(ChatEvent::Err(format!("derive queue keys: {e}")));
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                continue 'reconnect;
+            }
+        };
+        let auth = keys.auth;
+        let dh = keys.dh;
+        say(ChatEvent::Status("NEW queue…".into()));
+        let ids = match client.create_queue(&smp::RecipientKeys { auth_signing: auth.clone(), dh_secret: dh.clone() }) {
+            Ok(i) => i,
+            Err(e) => {
+                say(ChatEvent::Err(format!("NEW: {e} — retry in {:?}", backoff)));
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                continue 'reconnect;
+            }
+        };
+        // Сохраняем реквизиты очереди (шифрованное хранилище) — H5.
+        if let Err(e) = store.upsert(queue_store::QueueRecord {
+            index,
+            rcv_id: crypto::hex_encode(&ids.rcv_id),
+            snd_id: crypto::hex_encode(&ids.snd_id),
+            label: label.clone(),
+            host: host.clone(),
+            port,
+        }) {
+            say(ChatEvent::Err(format!("queue store save: {e}")));
         }
-        // неблокирующий poll входящих
-        match client.recv_transmissions() {
-            Ok(items) => {
-                for (_a, _corr, _e, c) in items {
-                    if let Ok(m) = smp::parse_msg(&c) {
-                        let rcv = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body);
-                        if let Ok(rcv) = rcv {
-                            if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
-                                if let Ok((_ph2, body)) = smp::parse_priv_header(&plain) {
-                                    say(ChatEvent::Incoming(String::from_utf8_lossy(body).to_string()));
-                                }
+        let eph_bytes: [u8; 32] = crypto::random_bytes(32).try_into().unwrap();
+        let eph = StaticSecret::from(eph_bytes);
+        let eph_pub_x509 = smp::x25519_x509(X25519Public::from(&eph).as_bytes());
+        let e2e = eph.diffie_hellman(&X25519Public::from(&dh));
+        let srv_pub = match smp::parse_x25519_x509(&ids.srv_dh_x509) {
+            Some(p) => p,
+            None => {
+                say(ChatEvent::Err("bad srv dh key".into()));
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                continue 'reconnect;
+            }
+        };
+        let srv = dh.diffie_hellman(&X25519Public::from(srv_pub));
+        // SUB — чтобы сервер пушил MSG без ручного GET
+        if let Err(e) = client.subscribe(&ids.rcv_id, &auth) {
+            say(ChatEvent::Err(format!("SUB: {e}")));
+        }
+        say(ChatEvent::Ready(crypto::hex_encode(&ids.rcv_id)));
+
+        loop {
+            // сначала pending (wait_response складывает входящие MSG туда)
+            let mut pending = client.take_pending();
+            for c in pending.drain(..) {
+                if let Ok(m) = smp::parse_msg(&c) {
+                    if let Ok(rcv) = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body) {
+                        if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
+                            if let Ok((_ph2, body)) = smp::parse_priv_header(&plain) {
+                                say(ChatEvent::Incoming(String::from_utf8_lossy(body).to_string()));
                             }
                         }
-                        let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
+                    }
+                    let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
+                }
+            }
+            // команды из UI
+            while let Ok(c) = cmd.try_recv() {
+                match c {
+                    WorkerCmd::Send(text) => {
+                        // ClientMessage = PrivHeader('_') + текст
+                        let mut body = vec![b'_'];
+                        body.extend_from_slice(text.as_bytes());
+                        match client.send_message(&ids.snd_id, e2e.as_bytes(), Some(&eph_pub_x509), &body, b"") {
+                            Ok(_) => say(ChatEvent::SentOk),
+                            Err(e) => say(ChatEvent::Err(format!("SEND: {e}"))),
+                        }
+                    }
+                    WorkerCmd::Quit => {
+                        // Аудит H5: при закрытии удаляем очередь на сервере (DEL),
+                        // чтобы на релее не оставались наши идентификаторы.
+                        if let Err(e) = client.delete_queue(&ids.rcv_id, &auth) {
+                            say(ChatEvent::Err(format!("DEL queue: {e}")));
+                        }
+                        let _ = store.remove(&label);
+                        return;
                     }
                 }
             }
-            Err(e) if e.contains("Resource temporarily unavailable") || e.contains("timed out") => {}
-            Err(e) => say(ChatEvent::Err(format!("recv: {e}"))),
-        }
-        let mut pending = client.take_pending();
-        for c in pending.drain(..) {
-            if let Ok(m) = smp::parse_msg(&c) {
-                if let Ok(rcv) = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body) {
-                    if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
-                        if let Ok((_ph2, body)) = smp::parse_priv_header(&plain) {
-                            say(ChatEvent::Incoming(String::from_utf8_lossy(body).to_string()));
+            // неблокирующий poll входящих
+            match client.recv_transmissions() {
+                Ok(items) => {
+                    for (_a, _corr, _e, c) in items {
+                        if let Ok(m) = smp::parse_msg(&c) {
+                            let rcv = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body);
+                            if let Ok(rcv) = rcv {
+                                if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
+                                    if let Ok((_ph2, body)) = smp::parse_priv_header(&plain) {
+                                        say(ChatEvent::Incoming(String::from_utf8_lossy(body).to_string()));
+                                    }
+                                }
+                            }
+                            let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
                         }
                     }
                 }
-                let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
+                Err(e) if e.contains("Resource temporarily unavailable") || e.contains("timed out") => {}
+                Err(e) => {
+                    // Аудит M3: фатальная ошибка чтения — не выходим, а reconnect с backoff.
+                    say(ChatEvent::Err(format!("recv: {e} — reconnect in {:?}", backoff)));
+                    std::thread::sleep(backoff);
+                    backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                    continue 'reconnect;
+                }
             }
+            let mut pending = client.take_pending();
+            for c in pending.drain(..) {
+                if let Ok(m) = smp::parse_msg(&c) {
+                    if let Ok(rcv) = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body) {
+                        if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
+                            if let Ok((_ph2, body)) = smp::parse_priv_header(&plain) {
+                                say(ChatEvent::Incoming(String::from_utf8_lossy(body).to_string()));
+                            }
+                        }
+                    }
+                    let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(800));
         }
-        std::thread::sleep(Duration::from_millis(800));
     }
 }
 
@@ -374,11 +395,30 @@ impl NeXXUi {
                 ui.separator();
                 if !self.chat_ready {
                     ui.label("Релей:");
+                    // Аудит M6: релеи берём из servers::SERVERS, а не из хардкода.
+                    let mut selected = crate::servers::SERVERS
+                        .iter()
+                        .position(|s| s.host == self.chat_host && s.port == self.chat_port)
+                        .unwrap_or(0);
+                    egui::ComboBox::from_id_salt("server_pick")
+                        .selected_text(crate::servers::SERVERS[selected].name)
+                        .show_ui(ui, |ui| {
+                            for (i, s) in crate::servers::SERVERS.iter().enumerate() {
+                                ui.selectable_value(&mut selected, i, s.name);
+                            }
+                        });
+                    let srv = &crate::servers::SERVERS[selected];
+                    self.chat_host = srv.host.to_string();
+                    self.chat_port = srv.port;
                     ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.chat_host);
-                        ui.add(egui::DragValue::new(&mut self.chat_port).range(443..=65535));
+                        ui.label(format!("{}:{}", self.chat_host, self.chat_port));
                     });
                     if ui.button("Подключиться").clicked() {
+                        // M6: CA только из конфига; неизвестный хост — отказ, не чужой CA.
+                        let Some(ca_pem) = crate::servers::ca_for(&self.chat_host, self.chat_port) else {
+                            self.chat_status = format!("неизвестный релей {}:{}", self.chat_host, self.chat_port);
+                            return;
+                        };
                         let seed = crypto::hex_decode(&self.seed_hex).unwrap_or_default();
                         let (ev_tx, ev_rx) = channel::<ChatEvent>();
                         let (cmd_tx, cmd_rx) = channel::<WorkerCmd>();
@@ -387,7 +427,7 @@ impl NeXXUi {
                         self.chat_status = "connecting…".into();
                         let host = self.chat_host.clone();
                         let port = self.chat_port;
-                        std::thread::spawn(move || chat_worker(host, port, seed, ev_tx, cmd_rx));
+                        std::thread::spawn(move || chat_worker(host, port, ca_pem, seed, ev_tx, cmd_rx));
                     }
                 } else {
                     ui.label(format!("Мой адрес: {}…", &self.chat_rcv[..self.chat_rcv.len().min(16)]));
