@@ -252,6 +252,10 @@ pub struct NeXXUi {
     invite_input: String,
     contact_name: String,
     contacts_status: String,
+    // группы (Этап 4.1)
+    groups: Vec<nexxrust::protocols::group_store::GroupRecord>,
+    group_name: String,
+    groups_status: String,
     // прокси (Этап 4.3): парсинг конфигов, health-check, kill-switch
     proxy_input: String,
     proxy_list: Vec<(String, String)>, // (remarks, json-конфиг)
@@ -271,6 +275,7 @@ enum Phase {
 enum Tab {
     Chats,
     Contacts,
+    Groups,
     Proxy,
     Wallet,
     Fleet,
@@ -303,6 +308,9 @@ impl NeXXUi {
             invite_input: String::new(),
             contact_name: String::new(),
             contacts_status: String::new(),
+            groups: vec![],
+            group_name: String::new(),
+            groups_status: String::new(),
             proxy_input: String::new(),
             proxy_list: vec![],
             proxy_selected: 0,
@@ -387,6 +395,7 @@ impl NeXXUi {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Chats, "💬 Чаты");
             ui.selectable_value(&mut self.tab, Tab::Contacts, "👤 Контакты");
+            ui.selectable_value(&mut self.tab, Tab::Groups, "👥 Группы");
             ui.selectable_value(&mut self.tab, Tab::Proxy, "🔒 Прокси");
             ui.selectable_value(&mut self.tab, Tab::Wallet, "💰 Кошелёк");
             ui.selectable_value(&mut self.tab, Tab::Fleet, "🖥️ Флот нод");
@@ -395,9 +404,86 @@ impl NeXXUi {
         match self.tab {
             Tab::Chats => self.chats(ui, ctx),
             Tab::Contacts => self.contacts_ui(ui),
+            Tab::Groups => self.groups_ui(ui),
             Tab::Proxy => self.proxy_ui(ui),
             Tab::Wallet => self.wallet(ui),
             Tab::Fleet => self.fleet(ui),
+        }
+    }
+
+    /// Вкладка «Группы» (Этап 4.1): список из шифрованного group_store + создание группы.
+    /// Сообщения fan-out'ятся per-member E2E (см. rustcore bin/group_smoke.rs — интероп OK).
+    fn groups_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("👥 Группы");
+        if ui.button("🔄 Загрузить группы").clicked() {
+            let path = std::path::PathBuf::from(format!("{}/groups.bin", data_dir()));
+            match nexxrust::protocols::group_store::GroupStore::open(&path, &self.seed) {
+                Ok(st) => {
+                    self.groups = st.groups().to_vec();
+                    self.groups_status = format!("✅ загружено групп: {}", self.groups.len());
+                }
+                Err(e) => self.groups_status = format!("⚠ {e}"),
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("Новая группа:");
+            ui.text_edit_singleline(&mut self.group_name);
+            if ui.button("➕ Создать").clicked() {
+                if self.group_name.trim().is_empty() {
+                    self.groups_status = "⚠ имя пустое".into();
+                } else {
+                    let path = std::path::PathBuf::from(format!("{}/groups.bin", data_dir()));
+                    match nexxrust::protocols::group_store::GroupStore::open(&path, &self.seed) {
+                        Ok(mut st) => {
+                            let creator_pub = nexxrust::crypto::hex_encode(
+                                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(
+                                    nexxrust::keytree::derive_path_ed25519(&self.seed, "m/0'/0'/1'")
+                                        .unwrap()
+                                        .private,
+                                ))
+                                .as_bytes(),
+                            );
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            let gid = nexxrust::protocols::group_store::GroupStore::id_for(
+                                &creator_pub,
+                                self.group_name.trim(),
+                                ts,
+                            )
+                            .unwrap();
+                            let g = nexxrust::protocols::group_store::GroupRecord {
+                                id: gid.clone(),
+                                name: self.group_name.trim().to_string(),
+                                creator_pub,
+                                members: vec![], // member'ы добавляются из контактов после QADD
+                                created_at: ts,
+                            };
+                            // validate требует хотя бы одного member'а — для новой группы
+                            // создателя считаем member'ом с пустой очередью? Нет: разрешим
+                            // пустой список при создании, валидируем при fan-out.
+                            if let Err(e) = st.upsert(g) {
+                                self.groups_status = format!("⚠ {e}");
+                            } else {
+                                self.groups = st.groups().to_vec();
+                                self.groups_status = format!("✅ группа создана id={gid}");
+                            }
+                        }
+                        Err(e) => self.groups_status = format!("⚠ {e}"),
+                    }
+                }
+            }
+        });
+        ui.separator();
+        if self.groups.is_empty() {
+            ui.label("Групп пока нет — создайте выше.");
+        }
+        for g in &self.groups {
+            ui.label(format!("👥 {} — id {} — members: {}", g.name, g.id, g.members.len()));
+        }
+        if !self.groups_status.is_empty() {
+            ui.colored_label(egui::Color32::LIGHT_GREEN, &self.groups_status);
         }
     }
 
