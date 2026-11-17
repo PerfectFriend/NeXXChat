@@ -270,3 +270,9 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - Тесты **101/101**, clippy **0**, XFTP FILE SMOKE OK после чистки варнингов.
 - Сборка: 3 ABI × 31 JNI (libnexxapp.so свежие закинуты в jniLibs вручную — build-android.sh кладёт только в target/), APK 157 514 992 Б → `~/apkexport/NeXX-allabi-debug.apk`, доставка в топик 23616 в фоне (slow mode ~15 мин).
 - Коммит `32461f1` → PerfectFriend/NeXXChat master.
+
+
+## 2026-11-17 (продолжение 3): QUSE-ротация очередей в библиотеку (Этап 4.1)
+- `rustcore/src/protocols/agent_cmds.rs`: `build_qadd`/`build_quse` (wire-формат SMP agent), `agent_msg_envelope` + hash-chain, `send_agent_msg`/`ack_msg`, `rotate_queue` (NEW q2 + SUB → HELLO→QADD(q2)→QUSE(q2) на старый snd). Unit 2/2.
+- `bin/agent_rotate_lib_smoke.rs`: **ROTATE LIB SMOKE OK** против smp6.simplex.im:5223 — сообщение после ротации принимается на новой очереди q2, q1 удаляется.
+- Тесты **103/103**, clippy **0**.
