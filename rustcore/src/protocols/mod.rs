@@ -1,6 +1,7 @@
 //! Протоколы SimpleX, реализуемые в Rust-ядре NeXX.
 
 pub mod connreq;
+pub mod contact_link;
 pub mod group_store;
 pub mod contact_store;
 pub mod message_store;

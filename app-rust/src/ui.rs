@@ -41,6 +41,97 @@ enum WorkerCmd {
     Quit,
 }
 
+// ===== 1-1 contact link (Этап 2.2): отдельный воркер с PeerLink =====
+enum LinkCmd {
+    /// Принять инвайт-ссылку: шлём свой connReq в очередь инвайтера.
+    AcceptInvite(String),
+    Send(String),
+    Quit,
+}
+
+enum LinkEvent {
+    Status(String),
+    MyInvite(String),   // наш инвайт-URI для раздачи
+    PeerReady(String),  // имя/id установленного peer (после handshake)
+    Incoming(String),
+    SentOk,
+    Err(String),
+}
+
+/// Воркер 1-1 линка: своя очередь (NEW+SUB), инвайт-URI, приём connReq от входящих
+/// и ответный connReq (handshake), приём/отправка чат-сообщений активному peer.
+fn link_worker(
+    host: String,
+    port: u16,
+    ca_pem: &'static str,
+    seed: Vec<u8>,
+    ev: Sender<LinkEvent>,
+    cmd: Receiver<LinkCmd>,
+) {
+    use nexxrust::protocols::connreq;
+    use nexxrust::protocols::contact_link::{PeerLink, TAG_CONN_REQ};
+    let say = |e: LinkEvent| { let _ = ev.send(e); };
+    let mut link = match PeerLink::new(&host, port, &seed, Some(ca_pem)) {
+        Ok(l) => l,
+        Err(e) => { say(LinkEvent::Err(format!("link NEW: {e}"))); return; }
+    };
+    let key_hash = crypto::sha256_raw(ca_pem.as_bytes());
+    let uri = link.invite_uri(&host, port, &key_hash);
+    say(LinkEvent::MyInvite(uri));
+    say(LinkEvent::Status(format!("очередь готова, жду инвайты/сообщения на {}", &host)));
+
+    loop {
+        // команды UI
+        while let Ok(c) = cmd.try_recv() {
+            match c {
+                LinkCmd::Quit => { link.close(); return; }
+                LinkCmd::AcceptInvite(uri) => {
+                    match link.accept_invite(&uri, &host, port, &key_hash, Duration::from_secs(5)) {
+                        Ok((snd, _dh)) => say(LinkEvent::Status(format!("connReq отправлен инвайтеру snd={}…", crypto::hex_encode(&snd)[..16].to_string()))),
+                        Err(e) => say(LinkEvent::Err(format!("accept: {e}"))),
+                    }
+                }
+                LinkCmd::Send(text) => match link.send_chat(&text) {
+                    Ok(()) => { say(LinkEvent::SentOk); }
+                    Err(e) => say(LinkEvent::Err(format!("send: {e}"))),
+                },
+            }
+        }
+        // входящие: короткий poll
+        match link.recv_raw(Duration::from_millis(700)) {
+            Ok((_mid, snd_pub, body)) => {
+                if body.first() == Some(&TAG_CONN_REQ) {
+                    match connreq::decode_conn_req(&body[1..]) {
+                        Ok(req) => {
+                            let peer_snd = req.queues.first().map(|q| crypto::hex_encode(&q.sender_id)).unwrap_or_default();
+                            if let Err(e) = link.install_peer(&req, &snd_pub) {
+                                say(LinkEvent::Err(format!("install peer: {e}")));
+                                continue;
+                            }
+                            // отвечаем своим connReq — handshake завершён с нашей стороны
+                            let my_req = link.conn_req(&host, port, &key_hash);
+                            let mut ab = vec![TAG_CONN_REQ];
+                            ab.extend_from_slice(&connreq::encode_conn_req(&my_req));
+                            let ps = link.peer_snd_id.clone();
+                            let pdh = link.peer_rcv_dh_x.clone();
+                            if let Err(e) = link.send_to_peer(&ps, &pdh, &ab) {
+                                say(LinkEvent::Err(format!("reply connReq: {e}")));
+                            } else {
+                                say(LinkEvent::PeerReady(peer_snd[..16.min(peer_snd.len())].to_string()));
+                            }
+                        }
+                        Err(e) => say(LinkEvent::Err(format!("decode connReq: {e}"))),
+                    }
+                } else {
+                    say(LinkEvent::Incoming(String::from_utf8_lossy(&body).to_string()));
+                }
+            }
+            Err(e) if e.contains("таймаут") => {}
+            Err(e) => say(LinkEvent::Err(format!("recv: {e}"))),
+        }
+    }
+}
+
 enum ChatEvent {
     Status(String),
     Ready(String),      // rcv_id hex
@@ -280,6 +371,16 @@ pub struct NeXXUi {
     kill_switch: bool,
     proxy_status: String,
     runtime: nexxrust::proxy_runtime::ProxyRuntime,
+    // 1-1 линк (Этап 2.2): воркер PeerLink — свой инвайт + handshake + чат с peer
+    link_tx: Option<Sender<LinkCmd>>,
+    link_rx: Option<Receiver<LinkEvent>>,
+    link_status: String,
+    my_invite: String,
+    link_ready: bool,
+    link_peer: String,
+    link_msgs: Vec<ChatMsg>,
+    link_input: String,
+    link_invite_input: String,
 }
 
 enum Phase {
@@ -337,6 +438,15 @@ impl NeXXUi {
             kill_switch: true, // по умолчанию kill-switch ВКЛЮЧЕН: без прокси — блок
             proxy_status: String::new(),
             runtime: nexxrust::proxy_runtime::ProxyRuntime::new(true),
+            link_tx: None,
+            link_rx: None,
+            link_status: String::new(),
+            my_invite: String::new(),
+            link_ready: false,
+            link_peer: String::new(),
+            link_msgs: vec![],
+            link_input: String::new(),
+            link_invite_input: String::new(),
         }
     }
 
@@ -1087,6 +1197,23 @@ impl NeXXUi {
                 }
             }
         }
+        // drains событий 1-1 линка
+        if let Some(rx) = &self.link_rx {
+            while let Ok(e) = rx.try_recv() {
+                match e {
+                    LinkEvent::Status(s) => self.link_status = s,
+                    LinkEvent::MyInvite(u) => self.my_invite = u,
+                    LinkEvent::PeerReady(p) => {
+                        self.link_ready = true;
+                        self.link_status = format!("🟢 peer установлен: {p}…");
+                        self.link_peer = p;
+                    }
+                    LinkEvent::Incoming(b) => self.link_msgs.push(ChatMsg { outgoing: false, body: b }),
+                    LinkEvent::SentOk => {}
+                    LinkEvent::Err(e) => self.link_status = format!("⚠ {e}"),
+                }
+            }
+        }
         let _ = ctx;
         egui::SidePanel::left("chat_list")
             .resizable(true)
@@ -1156,9 +1283,103 @@ impl NeXXUi {
                     });
                     if row.response.interact(egui::Sense::click()).clicked() {}
                 }
+                ui.separator();
+                ui.strong("🔗 1-1 линк (контакты)");
+                if self.link_tx.is_none() {
+                    if ui.button("🔗 Поднять 1-1 линк").clicked() {
+                        if !self.route_allowed() {
+                            self.link_status = "🚫 kill-switch: без прокси линк не поднимается".into();
+                        } else if let Some(ca_pem) = crate::servers::ca_for(&self.chat_host, self.chat_port) {
+                            let seed = crypto::hex_decode(&self.seed_hex).unwrap_or_default();
+                            let (ev_tx, ev_rx) = channel::<LinkEvent>();
+                            let (cmd_tx, cmd_rx) = channel::<LinkCmd>();
+                            self.link_rx = Some(ev_rx);
+                            self.link_tx = Some(cmd_tx);
+                            self.link_status = "link: NEW+SUB…".into();
+                            let host = self.chat_host.clone();
+                            let port = self.chat_port;
+                            std::thread::spawn(move || link_worker(host, port, ca_pem, seed, ev_tx, cmd_rx));
+                        } else {
+                            self.link_status = "неизвестный релей для линка".into();
+                        }
+                    }
+                } else {
+                    ui.label(format!("статус: {}", self.link_status));
+                    if !self.my_invite.is_empty() {
+                        ui.label("Мой инвайт (дайте собеседнику):");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::multiline(&mut self.my_invite.clone()).desired_rows(2).desired_width(220.0).interactive(false));
+                            if ui.button("📋").clicked() {
+                                ui.output_mut(|o| o.copied_text = self.my_invite.clone());
+                            }
+                        });
+                    }
+                    ui.label("Принять инвайт собеседника:");
+                    ui.text_edit_singleline(&mut self.link_invite_input);
+                    if ui.button("🤝 Принять").clicked() && !self.link_invite_input.is_empty() {
+                        if let Some(tx) = &self.link_tx {
+                            let _ = tx.send(LinkCmd::AcceptInvite(self.link_invite_input.trim().to_string()));
+                            self.link_invite_input.clear();
+                        }
+                    }
+                    if self.link_ready {
+                        ui.label(format!("🟢 peer: {}…", &self.link_peer[..self.link_peer.len().min(12)]));
+                    }
+                }
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            // Если поднят 1-1 линк и peer установлен — показываем чат с peer,
+            // иначе — self-chat.
+            if self.link_ready {
+                ui.horizontal(|ui| {
+                    ui.strong("🔗 1-1");
+                    ui.label(format!("peer {}…", &self.link_peer[..self.link_peer.len().min(12)]));
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for m in &self.link_msgs {
+                            let (align, color) = if m.outgoing {
+                                (egui::Align::Max, egui::Color32::from_rgb(0x2b, 0x5c, 0xb0))
+                            } else {
+                                (egui::Align::Min, egui::Color32::from_rgb(0x30, 0x30, 0x34))
+                            };
+                            ui.with_layout(egui::Layout::top_down(align).with_main_justify(true), |ui| {
+                                egui::Frame::none()
+                                    .fill(color)
+                                    .rounding(8.0)
+                                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(ui.available_width() * 0.7);
+                                        ui.label(&m.body);
+                                    });
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+                ui.separator();
+                let send = ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.link_input)
+                            .desired_width(ui.available_width() - 60.0)
+                            .hint_text("Сообщение peer'у…"),
+                    );
+                    let btn = ui.button("➤").clicked()
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    btn && !self.link_input.is_empty()
+                }).inner;
+                if send {
+                    let text = std::mem::take(&mut self.link_input);
+                    if let Some(tx) = &self.link_tx {
+                        let _ = tx.send(LinkCmd::Send(text.clone()));
+                        self.link_msgs.push(ChatMsg { outgoing: true, body: text });
+                    }
+                }
+                return;
+            }
             if !self.chat_ready {
                 ui.centered_and_justified(|ui| {
                     ui.label("Подключись к релею слева — и можно писать самому себе через публичную сеть SimpleX.");
