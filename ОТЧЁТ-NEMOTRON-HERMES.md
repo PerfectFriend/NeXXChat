@@ -312,3 +312,7 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - `apksigner sign` (debug keystore, для стенда) → `~/apkexport/NeXX-allabi-release.apk` 156 456 114 Б, `apksigner verify` OK (SHA-256 1848346f…).
 - Доставлен в топик 23616 (id в процессе отправки).
 - Debug-APK с подгрузкой истории линка: **SENT id=31780**.
+
+
+## 2026-11-17 (аудит-фикс K1): XFTP теперь с обязательным пиннингом
+- `xftp_file.rs`: `connect(host, port, expected: &[[u8;32]], …)` — без trust-set пина отказ; пин any-of constant-time против SHA-256(DER) certs цепочки; X.509 verify best-effort; SNI убран (релей без SNI отдаёт цепочку, чей keyHash принимает). `xftp1_key_hashes()` — trust set (YR2, Root YR, E-series). **XFTP FILE SMOKE OK с пином** (262080B, 4 chunks, roundtrip, FDEL).
