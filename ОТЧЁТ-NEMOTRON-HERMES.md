@@ -244,3 +244,11 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 
 ### Ограничения доступа
 Ключи, токены и пароли в отчёте и в коде не хранятся: чувствительные значения — только в `~/.hermes/secrets/*` (600, вне git).
+
+## 2026-11-17 (поздняя сессия): Xray/libv2ray мост доведён до зелёной сборки
+- `app-rust/src/v2ray_bridge.rs`: dlopen `libgojni.so`, прямые JNI-вызовы `initCoreEnv`/`newCoreController`/`startLoop` через raw-указатели (JavaVM/AssetManager не Clone — хранятся как usize в SendSync-обёртках, конструируются на месте через `from_raw`/`from_ptr`); `socks_config()` собирает merged-конфиг (SOCKS5-in на порту runtime + outbound из Proxy-таба), `extract_assets()` распаковывает geoip/geosite из APK.
+- `ui.rs`: кнопка «▶ Xray-ядро» в Proxy-табе — берёт выбранный узел, строит outbound (shadowsocks/vmess/… из `config_json`), запускает ядро.
+- `lib.rs`: `android_main` передаёт `vm_as_ptr()` и `asset_manager().ptr()`.
+- Тесты rustcore: **97/97 PASS** (3 прогона подряд), clippy **0 warnings** (flaky FAILED `route_allowed_reflects_kill_switch` в параллельном прогоне не воспроизводится — 3× зелёный).
+- Сборка: 3 ABI × 31 JNI export, libv2ray vendored (libgojni.so ×3 + assets) — `NeXX-allabi-debug.apk` 59 358 946 Б → Telegram topic 23616, **id 31759**.
+- Коммит `82a9dc0`, пуш в `PerfectFriend/NeXXChat` master.
