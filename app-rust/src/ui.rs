@@ -853,6 +853,9 @@ impl NeXXUi {
                 if ui.button("🩺 Health-check").clicked() {
                     self.proxy_status = self.health_check_selected();
                 }
+                if ui.button("▶ Xray-ядро (libv2ray)").clicked() {
+                    self.proxy_status = self.start_xray_core();
+                }
                 if ui.button(if self.proxy_active { "■ Выключить прокси" } else { "▶ Включить прокси" }).clicked() {
                     self.proxy_active = !self.proxy_active;
                     self.proxy_status = if self.proxy_active {
@@ -907,6 +910,49 @@ impl NeXXUi {
         self.proxy_list = items;
         self.proxy_selected = 0;
         Ok(self.proxy_list.len())
+    }
+
+    /// Запуск Xray-ядра (libv2ray) с выбранным прокси как outbound: SOCKS5-in на 127.0.0.1.
+    fn start_xray_core(&mut self) -> String {
+        if self.proxy_list.is_empty() {
+            return "⚠ сначала распарсьте конфиг выше".into();
+        }
+        let (_, j) = &self.proxy_list[self.proxy_selected.min(self.proxy_list.len() - 1)];
+        let v: serde_json::Value = match serde_json::from_str(j) {
+            Ok(v) => v,
+            Err(_) => return "битый json узла".into(),
+        };
+        let proto = v.get("protocol").and_then(|p| p.as_str()).unwrap_or("").to_string();
+        let cfg_json = v.get("config_json").and_then(|c| c.as_str()).unwrap_or("{}");
+        let outbound = match serde_json::from_str::<serde_json::Value>(cfg_json) {
+            Ok(inner) if inner.get("protocol").is_some() => {
+                let mut o = inner;
+                o["tag"] = serde_json::json!("proxy");
+                o
+            }
+            _ => serde_json::json!({
+                "tag": "proxy",
+                "protocol": if proto.is_empty() { "shadowsocks" } else { &proto },
+                "settings": serde_json::from_str::<serde_json::Value>(cfg_json).unwrap_or(serde_json::json!({})),
+            }),
+        };
+        let user_cfg = serde_json::json!({"outbounds": [outbound]}).to_string();
+        let port = self.runtime.port().unwrap_or(21080);
+        let cfg = match crate::v2ray_bridge::socks_config(port, &user_cfg) {
+            Ok(c) => c,
+            Err(e) => return format!("⚠ config: {e}"),
+        };
+        let assets = format!("{}/v2ray_assets", data_dir());
+        if let Err(e) = crate::v2ray_bridge::extract_assets(&assets) {
+            return format!("⚠ assets: {e}");
+        }
+        match crate::v2ray_bridge::start(&assets, "nexx-android", &cfg) {
+            Ok(()) => {
+                self.proxy_active = true;
+                format!("✅ Xray-ядро запущено: SOCKS5 127.0.0.1:{port} → {proto}")
+            }
+            Err(e) => format!("❌ Xray start: {e}"),
+        }
     }
 
     fn health_check_selected(&self) -> String {

@@ -15,6 +15,7 @@ use winit::platform::android::EventLoopBuilderExtAndroid;
 
 mod servers;
 mod ui;
+mod v2ray_bridge;
 
 fn configure_surface(
     device: &wgpu::Device,
@@ -134,6 +135,11 @@ fn create_gfx(window: &Arc<winit::window::Window>, ctx: &egui::Context) -> Resul
 
 #[no_mangle]
 fn android_main(android_app: AndroidApp) {
+    // JavaVM для v2ray-моста (dlopen libgojni.so + прямой JNI-вызов, см. v2ray_bridge).
+    #[cfg(target_os = "android")]
+    v2ray_bridge::set_vm(android_app.vm_as_ptr());
+    #[cfg(target_os = "android")]
+    v2ray_bridge::set_asset_manager(android_app.asset_manager().ptr().as_ptr() as *mut std::ffi::c_void);
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );

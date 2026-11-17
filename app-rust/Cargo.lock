@@ -1536,6 +1536,8 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "jni 0.21.1",
+ "libc",
  "log",
  "nexxrust",
  "pollster",

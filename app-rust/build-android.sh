@@ -74,3 +74,26 @@ PYEOF
     fi
   fi
 done
+
+# --- libv2ray (Этап 4.3 outbound): aar лежит в ../app/libs/libv2ray.aar (в git не коммитится,
+# бинарники запрещены аудитом M5). Приложение — чистый Rust NativeActivity (hasCode=false),
+# поэтому Java-слой aar не используем: вытаскиваем native libgojni.so и geo-ассеты,
+# а мост из Rust (src/v2ray_bridge.rs) вызывает JNI-экспорты напрямую через dlopen.
+AAR="$(dirname "$0")/../app/libs/libv2ray.aar"
+if [ -f "$AAR" ]; then
+  TMPAAR="$(mktemp -d)"
+  unzip -o -q "$AAR" -d "$TMPAAR"
+  for abi in arm64-v8a armeabi-v7a x86_64; do
+    src="$TMPAAR/jni/$abi/libgojni.so"
+    [ -f "$src" ] || continue
+    dst="$(dirname "$0")/../app/src/main/jniLibs/$abi"
+    mkdir -p "$dst"
+    cp "$src" "$dst/libgojni.so"
+  done
+  mkdir -p "$(dirname "$0")/../app/src/main/assets"
+  cp "$TMPAAR"/assets/geoip.dat "$TMPAAR"/assets/geosite.dat "$(dirname "$0")/../app/src/main/assets/" 2>/dev/null || true
+  rm -rf "$TMPAAR"
+  echo "OK: libv2ray vendored (libgojni.so x3 ABI + geoip/geosite в assets)"
+else
+  echo "WARN: $AAR не найден — Xray-ядро не будет в APK (SOCKS5 direct останется)"
+fi
