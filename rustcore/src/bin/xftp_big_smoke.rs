@@ -10,10 +10,10 @@ async fn main() {
     let host = args.first().cloned().unwrap_or_else(|| "xftp1.simplex.im".into());
     let port: u16 = args.get(1).cloned().unwrap_or_else(|| "443".into()).parse().unwrap();
 
-    let size = 8 * 1024 * 1024;
+    let size: usize = 8 * 1024 * 1024;
     let file: Vec<u8> = (0..size as u32).map(|i| ((i * 2654435761) >> 13) as u8).collect();
     let digest = crypto::sha256_raw(&file);
-    println!("upload {size}B ({} chunks)…", size.div_ceil(CHUNK_PLAIN as u32) as usize);
+    println!("upload {size}B ({} chunks)…", size.div_ceil(CHUNK_PLAIN));
 
     let desc = xftp_file::upload_file(&host, port, &file).await.expect("upload 8MB");
     println!("OK upload: {} chunks", desc.chunks.len());
