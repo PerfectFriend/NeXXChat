@@ -132,6 +132,69 @@ fn link_worker(
     }
 }
 
+// ===== Файлы (Этап 3.2): XFTP chunked через библиотеку xftp_file =====
+enum FileCmd {
+    Upload(String),      // путь к файлу
+    Download(String),    // link nexx://file#/…
+    Quit,
+}
+enum FileEvent {
+    Status(String),
+    Link(String),
+    Saved(String),
+    Err(String),
+}
+
+fn file_worker(ev: Sender<FileEvent>, cmd: Receiver<FileCmd>) {
+    use nexxrust::protocols::xftp_file;
+    let say = |e: FileEvent| { let _ = ev.send(e); };
+    let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
+        Ok(r) => r,
+        Err(e) => { say(FileEvent::Err(format!("tokio rt: {e}"))); return; }
+    };
+    while let Ok(c) = cmd.recv() {
+        match c {
+            FileCmd::Quit => break,
+            FileCmd::Upload(path) => {
+                say(FileEvent::Status(format!("читаю {path}…")));
+                let data = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(e) => { say(FileEvent::Err(format!("read: {e}"))); continue; }
+                };
+                say(FileEvent::Status(format!("upload {}B chunked…", data.len())));
+                let r = rt.block_on(xftp_file::upload_file("xftp1.simplex.im", 443, &data));
+                match r {
+                    Ok(desc) => {
+                        let link = desc.encode();
+                        say(FileEvent::Status(format!("OK {} chunks", desc.chunks.len())));
+                        say(FileEvent::Link(link));
+                    }
+                    Err(e) => say(FileEvent::Err(format!("upload: {e}"))),
+                }
+            }
+            FileCmd::Download(link) => {
+                let r = rt.block_on(async move {
+                    let desc = xftp_file::FileDesc::decode(&link)?;
+                    let data = xftp_file::download_file(&desc).await?;
+                    Ok::<_, String>((desc, data))
+                });
+                match r {
+                    Ok((desc, data)) => {
+                        let dir = format!("{}/downloads", data_dir());
+                        let _ = std::fs::create_dir_all(&dir);
+                        let name = format!("{}/file_{}B.bin", dir, desc.size);
+                        match std::fs::write(&name, &data) {
+                            Ok(()) => say(FileEvent::Saved(name)),
+                            Err(e) => say(FileEvent::Err(format!("write: {e}"))),
+                        }
+                    }
+                    Err(e) => say(FileEvent::Err(format!("download: {e}"))),
+                }
+            }
+        }
+    }
+}
+
 enum ChatEvent {
     Status(String),
     Ready(String),      // rcv_id hex
@@ -381,6 +444,13 @@ pub struct NeXXUi {
     link_msgs: Vec<ChatMsg>,
     link_input: String,
     link_invite_input: String,
+    // файлы (Этап 3.2): XFTP chunked upload/download
+    file_tx: Option<Sender<FileCmd>>,
+    file_rx: Option<Receiver<FileEvent>>,
+    file_path: String,
+    file_link: String,
+    file_recv_link: String,
+    file_status: String,
 }
 
 enum Phase {
@@ -394,6 +464,7 @@ enum Tab {
     Contacts,
     Groups,
     Proxy,
+    Files,
     Wallet,
     Fleet,
 }
@@ -447,6 +518,12 @@ impl NeXXUi {
             link_msgs: vec![],
             link_input: String::new(),
             link_invite_input: String::new(),
+            file_tx: None,
+            file_rx: None,
+            file_path: String::new(),
+            file_link: String::new(),
+            file_recv_link: String::new(),
+            file_status: String::new(),
         }
     }
 
@@ -526,6 +603,7 @@ impl NeXXUi {
             ui.selectable_value(&mut self.tab, Tab::Contacts, "👤 Контакты");
             ui.selectable_value(&mut self.tab, Tab::Groups, "👥 Группы");
             ui.selectable_value(&mut self.tab, Tab::Proxy, "🔒 Прокси");
+            ui.selectable_value(&mut self.tab, Tab::Files, "📎 Файлы");
             ui.selectable_value(&mut self.tab, Tab::Wallet, "💰 Кошелёк");
             ui.selectable_value(&mut self.tab, Tab::Fleet, "🖥️ Флот нод");
         });
@@ -535,6 +613,7 @@ impl NeXXUi {
             Tab::Contacts => self.contacts_ui(ui),
             Tab::Groups => self.groups_ui(ui),
             Tab::Proxy => self.proxy_ui(ui),
+            Tab::Files => self.files_ui(ui),
             Tab::Wallet => self.wallet(ui),
             Tab::Fleet => self.fleet(ui),
         }
@@ -1436,6 +1515,70 @@ impl NeXXUi {
                 }
             }
         });
+    }
+
+    /// Вкладка «📎 Файлы» (Этап 3.2): XFTP chunked upload → link nexx://file#/…,
+    /// приём по link → download в data_dir/downloads.
+    fn files_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("📎 Файлы (XFTP chunked, 64KB packets)");
+        if let Some(rx) = &self.file_rx {
+            while let Ok(e) = rx.try_recv() {
+                match e {
+                    FileEvent::Status(s) => self.file_status = s,
+                    FileEvent::Link(l) => { self.file_link = l; self.file_status = "✅ загружено, link ниже".into(); }
+                    FileEvent::Saved(p) => self.file_status = format!("✅ сохранено: {p}"),
+                    FileEvent::Err(e) => self.file_status = format!("⚠ {e}"),
+                }
+            }
+        }
+        ui.label("XFTP-релей: xftp1.simplex.im:443 (ALPN xftp/1, пиннинг по keyHash CA в clientHello)");
+        ui.separator();
+        ui.strong("Отправка файла:");
+        ui.horizontal(|ui| {
+            ui.label("путь:");
+            ui.text_edit_singleline(&mut self.file_path);
+            if ui.button("⬆ Загрузить").clicked() && !self.file_path.is_empty() {
+                if self.file_tx.is_none() {
+                    let (ev_tx, ev_rx) = channel::<FileEvent>();
+                    let (cmd_tx, cmd_rx) = channel::<FileCmd>();
+                    self.file_rx = Some(ev_rx);
+                    self.file_tx = Some(cmd_tx);
+                    std::thread::spawn(move || file_worker(ev_tx, cmd_rx));
+                }
+                if let Some(tx) = &self.file_tx {
+                    let _ = tx.send(FileCmd::Upload(self.file_path.clone()));
+                    self.file_status = "загрузка…".into();
+                }
+            }
+        });
+        if !self.file_link.is_empty() {
+            ui.label("Ссылка на файл (дайте собеседнику / вставьте в чат):");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::multiline(&mut self.file_link.clone()).desired_rows(3).desired_width(420.0).interactive(false));
+                if ui.button("📋").clicked() {
+                    ui.output_mut(|o| o.copied_text = self.file_link.clone());
+                }
+            });
+        }
+        ui.separator();
+        ui.strong("Приём файла по ссылке:");
+        ui.text_edit_singleline(&mut self.file_recv_link);
+        if ui.button("⬇ Скачать").clicked() && !self.file_recv_link.is_empty() {
+            if self.file_tx.is_none() {
+                let (ev_tx, ev_rx) = channel::<FileEvent>();
+                let (cmd_tx, cmd_rx) = channel::<FileCmd>();
+                self.file_rx = Some(ev_rx);
+                self.file_tx = Some(cmd_tx);
+                std::thread::spawn(move || file_worker(ev_tx, cmd_rx));
+            }
+            if let Some(tx) = &self.file_tx {
+                let _ = tx.send(FileCmd::Download(self.file_recv_link.trim().to_string()));
+                self.file_status = "скачивание…".into();
+            }
+        }
+        if !self.file_status.is_empty() {
+            ui.colored_label(egui::Color32::LIGHT_GREEN, &self.file_status);
+        }
     }
 
     fn wallet(&self, ui: &mut egui::Ui) {

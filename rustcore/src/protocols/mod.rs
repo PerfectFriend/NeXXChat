@@ -9,3 +9,4 @@ pub mod queue_store;
 pub mod smp;
 pub mod smp_client;
 pub mod smp_wire;
+pub mod xftp_file;
