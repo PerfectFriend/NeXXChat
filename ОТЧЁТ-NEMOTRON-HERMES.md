@@ -321,3 +321,7 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 ## 2026-11-17 (аудит-фиксы K1+V1)
 - **K1 закрыт:** XFTP `connect` требует trust-set keyHash (ct_eq any-of, без пина — отказ) + X.509 best-effort; SNI убран (релей без SNI отдаёт принимаемую цепочку). XFTP FILE SMOKE OK с пином; unit 104/104, clippy 0.
 - **V1 закрыт:** все 25 JNI-экспортов `jni_api.rs` обёрнуты в `ffi_guard!` (catch_unwind → JSON-ошибка вместо abort). Теперь 31/31 экспортов под защитой (6 в jni_smp + 25 в jni_api).
+
+
+## 2026-11-17 (аудит-фикс S2)
+- `proxy_runtime.rs`: лимит 256 одновременных CONNECT (счётчик, лишние закрываются сразу) + `connect_timeout(15s)` и для direct, и для upstream (resolve_one с таймаутом, без блокирующего DNS). Тесты proxy_runtime 4/4, всего 104/104, clippy 0.

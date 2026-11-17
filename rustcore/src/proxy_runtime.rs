@@ -22,6 +22,9 @@ pub struct ProxyRuntime {
     pub port: Arc<std::sync::Mutex<Option<u16>>>,
     /// Upstream SOCKS5 (напр. Xray-ядро libv2ray на 127.0.0.1): если задан — весь CONNECT идёт через него.
     pub upstream: Arc<std::sync::Mutex<Option<(String, u16)>>>,
+    /// S2: лимит одновременно обслуживаемых соединений (semaphore).
+    /// S2: счётчик активных соединений и лимит.
+    pub conns: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ProxyRuntime {
@@ -31,8 +34,12 @@ impl ProxyRuntime {
             running: Arc::new(AtomicBool::new(false)),
             port: Arc::new(std::sync::Mutex::new(None)),
             upstream: Arc::new(std::sync::Mutex::new(None)),
+            conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
+
+    /// S2: максимум simultaneous CONNECT-сессий.
+    pub const MAX_CONNS: usize = 256;
 
     /// Устанавливает upstream-SOCKS5 (host, port). None — прямой CONNECT.
     pub fn set_upstream(&self, addr: Option<(String, u16)>) {
@@ -60,6 +67,7 @@ impl ProxyRuntime {
         let allow = self.allow.clone();
         let running = self.running.clone();
         let upstream = self.upstream.clone();
+        let conns = self.conns.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 if !running.load(Ordering::SeqCst) {
@@ -67,10 +75,18 @@ impl ProxyRuntime {
                 }
                 match stream {
                     Ok(s) => {
+                        // S2: лимит соединений — при превышении сразу закрываем
+                        let cur = conns.fetch_add(1, Ordering::SeqCst) + 1;
+                        if cur > Self::MAX_CONNS {
+                            conns.fetch_sub(1, Ordering::SeqCst);
+                            continue;
+                        }
                         let allow = allow.clone();
                         let upstream = upstream.clone();
+                        let conns2 = conns.clone();
                         thread::spawn(move || {
                             let _ = handle_socks5(s, allow, upstream);
+                            conns2.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
                     Err(_) => break,
@@ -164,14 +180,14 @@ fn handle_socks5(mut client: TcpStream, allow: Arc<AtomicBool>, upstream: Arc<st
     // если задан upstream (Xray/libv2ray) — CONNECT через него, иначе прямой
     let up = upstream.lock().unwrap().clone();
     let target = match up {
-        Some((uh, up_port)) => match socks5_connect_upstream(&uh, up_port, &host, port) {
+        Some((uh, up_port)) => match socks5_connect_upstream_timeout(&uh, up_port, &host, port) {
             Ok(t) => t,
             Err(_) => {
                 client.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
                 return Ok(());
             }
         },
-        None => match TcpStream::connect((host.as_str(), port)) {
+        None => match resolve_one(host.as_str(), port).and_then(|a| TcpStream::connect_timeout(&a, Duration::from_secs(15))) {
             Ok(t) => t,
             Err(_) => {
                 client.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
@@ -184,6 +200,58 @@ fn handle_socks5(mut client: TcpStream, allow: Arc<AtomicBool>, upstream: Arc<st
     let _ = client.set_read_timeout(None);
     let _ = target.set_read_timeout(None);
     pipe(client, target)
+}
+
+/// S2: резолв одного адреса с таймаутом (без блокирующего DNS на 60s).
+fn resolve_one(host: &str, port: u16) -> std::io::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    // если это IP — сразу
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+    let addrs: Vec<std::net::SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    addrs.into_iter().next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no addr"))
+}
+
+/// S2: как socks5_connect_upstream, но с connect_timeout 15s.
+pub fn socks5_connect_upstream_timeout(up_host: &str, up_port: u16, host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let addr = resolve_one(up_host, up_port)?;
+    let s = TcpStream::connect_timeout(&addr, Duration::from_secs(15))?;
+    socks5_handshake_over(s, host, port)
+}
+
+fn socks5_handshake_over(mut s: TcpStream, host: &str, port: u16) -> std::io::Result<TcpStream> {
+    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    s.write_all(&[0x05, 0x01, 0x00])?;
+    let mut r = [0u8; 2];
+    s.read_exact(&mut r)?;
+    if r != [0x05, 0x00] {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "upstream auth required"));
+    }
+    let mut req = vec![0x05, 0x01, 0x00];
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        req.push(0x01);
+        req.extend_from_slice(&ip.octets());
+    } else {
+        req.push(0x03);
+        req.push(host.len().min(255) as u8);
+        req.extend_from_slice(&host.as_bytes()[..host.len().min(255)]);
+    }
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req)?;
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head)?;
+    if head[1] != 0x00 {
+        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, format!("upstream reply 0x{:02x}", head[1])));
+    }
+    match head[3] {
+        0x01 => { let mut b = [0u8; 6]; s.read_exact(&mut b)?; }
+        0x03 => { let mut l = [0u8; 1]; s.read_exact(&mut l)?; let mut b = vec![0u8; l[0] as usize + 2]; s.read_exact(&mut b)?; }
+        0x04 => { let mut b = [0u8; 18]; s.read_exact(&mut b)?; }
+        _ => {}
+    }
+    s.set_read_timeout(None)?;
+    Ok(s)
 }
 
 /// SOCKS5-клиент к upstream (Xray): handshake no-auth + CONNECT host:port.
