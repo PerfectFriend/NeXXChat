@@ -451,6 +451,8 @@ pub struct NeXXUi {
     file_link: String,
     file_recv_link: String,
     file_status: String,
+    file_preview: Option<egui::TextureHandle>,
+    file_preview_name: String,
 }
 
 enum Phase {
@@ -524,6 +526,8 @@ impl NeXXUi {
             file_link: String::new(),
             file_recv_link: String::new(),
             file_status: String::new(),
+            file_preview: None,
+            file_preview_name: String::new(),
         }
     }
 
@@ -1578,7 +1582,29 @@ impl NeXXUi {
                 match e {
                     FileEvent::Status(s) => self.file_status = s,
                     FileEvent::Link(l) => { self.file_link = l; self.file_status = "✅ загружено, link ниже".into(); }
-                    FileEvent::Saved(p) => self.file_status = format!("✅ сохранено: {p}"),
+                    FileEvent::Saved(p) => {
+                        self.file_status = format!("✅ сохранено: {p}");
+                        let ext = std::path::Path::new(&p).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp") {
+                            if let Ok(bytes) = std::fs::read(&p) {
+                                if let Ok(img) = image::load_from_memory(&bytes) {
+                                    let rgba = img.to_rgba8();
+                                    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                                    let tex = ui.ctx().load_texture(
+                                        format!("file_preview_{p}"),
+                                        egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw()),
+                                        egui::TextureOptions::LINEAR,
+                                    );
+                                    self.file_preview = Some(tex);
+                                    self.file_preview_name = p.clone();
+                                } else {
+                                    self.file_preview = None;
+                                }
+                            }
+                        } else {
+                            self.file_preview = None;
+                        }
+                    }
                     FileEvent::Err(e) => self.file_status = format!("⚠ {e}"),
                 }
             }
@@ -1630,6 +1656,14 @@ impl NeXXUi {
         }
         if !self.file_status.is_empty() {
             ui.colored_label(egui::Color32::LIGHT_GREEN, &self.file_status);
+        }
+        if let Some(tex) = &self.file_preview {
+            ui.separator();
+            ui.label(format!("🖼 Превью: {}", self.file_preview_name));
+            let max_w = ui.available_width().min(420.0);
+            let size = tex.size_vec2();
+            let scale = (max_w / size.x).min(1.0);
+            ui.image((tex.id(), size * scale));
         }
     }
 

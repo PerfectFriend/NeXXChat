@@ -282,3 +282,8 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - `app-rust/src/ui.rs`: groups_ui переписан в двухпанельный вид (список групп слева, чат выбранной группы справа: история-пузыри из message_store по group_id, ввод снизу -> fan-out send_group_msg на всех member'ов, участники + добавление из контактов). aarch64 .so 16 572 480 Б, 31 JNI.
 - APK 157 514 992 Б доставлен в топик 23616: **SENT id=31769** (через клон session nexx_mtproto_apk.session, т.к. основной session занят джинглами — database is locked).
 - Тесты 103/103, clippy 0.
+
+
+## 2026-11-17 (продолжение 5): превью медиа в 📎 Файлы
+- `app-rust`: добавлен `image` crate (png/jpeg/webp/gif/bmp); после `FileEvent::Saved` для картинок — inline-превью через `ctx().load_texture` (масштаб ≤ 420px). aarch64 `.so` 17 298 968 Б, 31 JNI.
+- APK с превью — сборка в фоне, доставка в топик 23616 следом.
