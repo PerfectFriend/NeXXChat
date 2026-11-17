@@ -148,7 +148,9 @@ mod imp {
                         }
                     }
                 }
-                libc::dlclose(handle);
+                // N3: dlclose не делаем — libgojni резидентна (повторный start после stop
+                // без dlclose безопасен); handle держим в CTRL до конца процесса.
+                let _ = handle;
             }
         }
     }

@@ -317,12 +317,13 @@ fn seed_store_insert(seed: Vec<u8>) -> i64 {
     h
 }
 
-fn seed_store_get(handle: i64) -> Option<Vec<u8>> {
+/// N1: сид наружу только в Zeroizing — клон затирается получателем.
+fn seed_store_get(handle: i64) -> Option<zeroize::Zeroizing<Vec<u8>>> {
     SEED_STORE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&handle)
-        .map(|z| (**z).clone())
+        .map(|z| zeroize::Zeroizing::new((**z).clone()))
 }
 
 fn seed_store_remove(handle: i64) -> bool {
@@ -361,7 +362,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_seedRelease(
     if seed_store_remove(handle) { 1 } else { 0 }
 }
 
-fn seed_or_err(env: &mut JNIEnv, handle: jni::sys::jlong) -> Result<Vec<u8>, jstring> {
+fn seed_or_err(env: &mut JNIEnv, handle: jni::sys::jlong) -> Result<zeroize::Zeroizing<Vec<u8>>, jstring> {
     match seed_store_get(handle) {
         Some(s) => Ok(s),
         None => Err(to_jstring(env, err_json("unknown seed handle"))),
@@ -669,7 +670,7 @@ mod tests {
     fn seed_handle_roundtrip_and_release() {
         let h = seed_store_insert(vec![0xAB; 64]);
         assert!(h > 0);
-        assert_eq!(seed_store_get(h), Some(vec![0xAB; 64]));
+        assert_eq!(seed_store_get(h).map(|z| z.to_vec()), Some(vec![0xAB; 64]));
         assert!(seed_store_remove(h));
         assert!(seed_store_get(h).is_none());
         assert!(!seed_store_remove(h)); // повторный release → false
@@ -680,8 +681,8 @@ mod tests {
         let a = seed_store_insert(vec![1; 32]);
         let b = seed_store_insert(vec![2; 32]);
         assert_ne!(a, b);
-        assert_eq!(seed_store_get(a), Some(vec![1; 32]));
-        assert_eq!(seed_store_get(b), Some(vec![2; 32]));
+        assert_eq!(seed_store_get(a).map(|z| z.to_vec()), Some(vec![1; 32]));
+        assert_eq!(seed_store_get(b).map(|z| z.to_vec()), Some(vec![2; 32]));
         seed_store_remove(a);
         seed_store_remove(b);
     }
