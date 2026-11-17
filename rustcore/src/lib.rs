@@ -4,6 +4,7 @@
 pub mod bip39;
 pub mod keytree;
 pub mod control;
+pub mod proxy_runtime;
 pub mod crypto;
 mod jni_api;
 pub mod proxy_parse;

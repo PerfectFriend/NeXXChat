@@ -259,6 +259,7 @@ pub struct NeXXUi {
     proxy_active: bool,
     kill_switch: bool,
     proxy_status: String,
+    runtime: nexxrust::proxy_runtime::ProxyRuntime,
 }
 
 enum Phase {
@@ -308,6 +309,7 @@ impl NeXXUi {
             proxy_active: false,
             kill_switch: true, // по умолчанию kill-switch ВКЛЮЧЕН: без прокси — блок
             proxy_status: String::new(),
+            runtime: nexxrust::proxy_runtime::ProxyRuntime::new(true),
         }
     }
 
@@ -412,9 +414,30 @@ impl NeXXUi {
             }
         });
         let decision = nexxrust::control::route_decision(
-            self.proxy_active, false, false, false, !self.kill_switch,
+            self.proxy_active || self.runtime.port().is_some(), false, false, false, !self.kill_switch,
         );
         ui.label(format!("Текущее решение маршрута: {decision}"));
+        if let Some(p) = self.runtime.port() {
+            ui.label(format!("🧦 локальный SOCKS5: 127.0.0.1:{p} (приложения ходят через него)"));
+        }
+        ui.horizontal(|ui| {
+            let running = self.runtime.port().is_some();
+            if ui.button(if running { "■ Остановить SOCKS5" } else { "▶ Запустить локальный SOCKS5" }).clicked() {
+                let lock = format!("{}/nexx_ports.lock", data_dir());
+                if running {
+                    self.runtime.stop(&lock);
+                    self.proxy_status = "⏸ SOCKS5 остановлен, kill-switch снова блокирует прямой трафик".into();
+                } else {
+                    let p = self.runtime.start(&lock, 21000, 21999);
+                    self.proxy_status = if p > 0 {
+                        self.proxy_active = true;
+                        format!("✅ SOCKS5 поднят на 127.0.0.1:{p} — kill-switch пройден")
+                    } else {
+                        "⚠ не удалось выделить порт 21000-21999".into()
+                    };
+                }
+            }
+        });
         ui.separator();
         ui.label("Конфиг / подписка (ss://, vless://, vmess://, trojan://, [Interface], xray JSON или base64):");
         ui.add(egui::TextEdit::multiline(&mut self.proxy_input).desired_rows(3));
