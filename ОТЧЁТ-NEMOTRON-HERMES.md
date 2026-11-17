@@ -297,3 +297,7 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 ## 2026-11-17 (продолжение 7): Этап 4.3 — SOCKS5 через Xray/libv2ray
 - `rustcore/src/proxy_runtime.rs`: `ProxyRuntime.upstream` + `set_upstream()` + `socks5_connect_upstream()` (handshake no-auth, CONNECT domain/IPv4). Новый тест `upstream_chain_echo_roundtrip`: клиент→SOCKS→upstream-SOCKS→echo OK. **104/104**, clippy 0.
 - `app-rust`: при старте Xray-ядра локальный SOCKS5 автоматически направляется через него (upstream 127.0.0.1:xray); «■ Стоп Xray» сбрасывает upstream. aarch64 .so 17 299 928 Б, 31 JNI.
+
+
+## 2026-11-17 (продолжение 8): история 1-1 линка в message_store
+- `app-rust`: входящие/исходящие сообщения 1-1 линка (PeerLink) теперь пишутся в шифрованный `messages.bin` (contact_id = link_peer) через `MessageStore::push` — история переживает рестарт.

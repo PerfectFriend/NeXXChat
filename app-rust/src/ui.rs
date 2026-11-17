@@ -849,6 +849,21 @@ impl NeXXUi {
         }
     }
 
+    /// Запись сообщения 1-1 линка в шифрованную историю (contact_id = link_peer).
+    fn store_link_msg(&self, outgoing: bool, body: &str) {
+        if self.link_peer.is_empty() || self.seed.is_empty() { return; }
+        let path = std::path::PathBuf::from(format!("{}/messages.bin", data_dir()));
+        if let Ok(mut ms) = nexxrust::protocols::message_store::MessageStore::open(&path, &self.seed) {
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let _ = ms.push(nexxrust::protocols::message_store::ChatMessage {
+                contact_id: self.link_peer.clone(),
+                outgoing,
+                body: body.to_string(),
+                ts,
+            });
+        }
+    }
+
     /// Приём групповых сообщений: poll всех своих очередей, два слоя шифрования,
     /// фильтр по group_id известных групп, запись в message_store, ACK.
     fn recv_group_msgs(&mut self) -> String {
@@ -1364,7 +1379,10 @@ impl NeXXUi {
                         self.link_status = format!("🟢 peer установлен: {p}…");
                         self.link_peer = p;
                     }
-                    LinkEvent::Incoming(b) => self.link_msgs.push(ChatMsg { outgoing: false, body: b }),
+                    LinkEvent::Incoming(b) => {
+                        self.link_msgs.push(ChatMsg { outgoing: false, body: b.clone() });
+                        self.store_link_msg(false, &b);
+                    }
                     LinkEvent::SentOk => {}
                     LinkEvent::Err(e) => self.link_status = format!("⚠ {e}"),
                 }
@@ -1531,6 +1549,7 @@ impl NeXXUi {
                     let text = std::mem::take(&mut self.link_input);
                     if let Some(tx) = &self.link_tx {
                         let _ = tx.send(LinkCmd::Send(text.clone()));
+                        self.store_link_msg(true, &text);
                         self.link_msgs.push(ChatMsg { outgoing: true, body: text });
                     }
                 }
