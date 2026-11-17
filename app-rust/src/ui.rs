@@ -252,6 +252,13 @@ pub struct NeXXUi {
     invite_input: String,
     contact_name: String,
     contacts_status: String,
+    // прокси (Этап 4.3): парсинг конфигов, health-check, kill-switch
+    proxy_input: String,
+    proxy_list: Vec<(String, String)>, // (remarks, json-конфиг)
+    proxy_selected: usize,
+    proxy_active: bool,
+    kill_switch: bool,
+    proxy_status: String,
 }
 
 enum Phase {
@@ -263,6 +270,7 @@ enum Phase {
 enum Tab {
     Chats,
     Contacts,
+    Proxy,
     Wallet,
     Fleet,
 }
@@ -294,6 +302,12 @@ impl NeXXUi {
             invite_input: String::new(),
             contact_name: String::new(),
             contacts_status: String::new(),
+            proxy_input: String::new(),
+            proxy_list: vec![],
+            proxy_selected: 0,
+            proxy_active: false,
+            kill_switch: true, // по умолчанию kill-switch ВКЛЮЧЕН: без прокси — блок
+            proxy_status: String::new(),
         }
     }
 
@@ -371,6 +385,7 @@ impl NeXXUi {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Chats, "💬 Чаты");
             ui.selectable_value(&mut self.tab, Tab::Contacts, "👤 Контакты");
+            ui.selectable_value(&mut self.tab, Tab::Proxy, "🔒 Прокси");
             ui.selectable_value(&mut self.tab, Tab::Wallet, "💰 Кошелёк");
             ui.selectable_value(&mut self.tab, Tab::Fleet, "🖥️ Флот нод");
         });
@@ -378,9 +393,130 @@ impl NeXXUi {
         match self.tab {
             Tab::Chats => self.chats(ui, ctx),
             Tab::Contacts => self.contacts_ui(ui),
+            Tab::Proxy => self.proxy_ui(ui),
             Tab::Wallet => self.wallet(ui),
             Tab::Fleet => self.fleet(ui),
         }
+    }
+
+    /// Вкладка «Прокси» (Этап 4.3): импорт ss:// / vless:// / vmess:// / trojan:// /
+    /// wg-conf / xray-json или base64-подписки, health-check, kill-switch.
+    /// Kill-switch: пока прокси не активен и kill_switch включён — route_decision = block,
+    /// и чат refused (см. chats()).
+    fn proxy_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🔒 Прокси и kill-switch");
+        ui.horizontal(|ui| {
+            ui.label("Kill-switch:");
+            if ui.button(if self.kill_switch { "🟢 ВКЛ (блок без прокси)" } else { "🔴 ВЫКЛ" }).clicked() {
+                self.kill_switch = !self.kill_switch;
+            }
+        });
+        let decision = nexxrust::control::route_decision(
+            self.proxy_active, false, false, false, !self.kill_switch,
+        );
+        ui.label(format!("Текущее решение маршрута: {decision}"));
+        ui.separator();
+        ui.label("Конфиг / подписка (ss://, vless://, vmess://, trojan://, [Interface], xray JSON или base64):");
+        ui.add(egui::TextEdit::multiline(&mut self.proxy_input).desired_rows(3));
+        if ui.button("🔍 Распарсить").clicked() {
+            match self.parse_proxy_input() {
+                Ok(n) => self.proxy_status = format!("✅ распарсено узлов: {n}"),
+                Err(e) => self.proxy_status = format!("⚠ {e}"),
+            }
+        }
+        if !self.proxy_list.is_empty() {
+            egui::ComboBox::from_id_salt("proxy_pick")
+                .selected_text(self.proxy_list[self.proxy_selected.min(self.proxy_list.len() - 1)].0.clone())
+                .show_ui(ui, |ui| {
+                    for (i, (r, _)) in self.proxy_list.iter().enumerate() {
+                        ui.selectable_value(&mut self.proxy_selected, i, r.clone());
+                    }
+                });
+            ui.horizontal(|ui| {
+                if ui.button("🩺 Health-check").clicked() {
+                    self.proxy_status = self.health_check_selected();
+                }
+                if ui.button(if self.proxy_active { "■ Выключить прокси" } else { "▶ Включить прокси" }).clicked() {
+                    self.proxy_active = !self.proxy_active;
+                    self.proxy_status = if self.proxy_active {
+                        "✅ прокси активен — трафик идёт через него (kill-switch пройден)".into()
+                    } else {
+                        "⏸ прокси выключен".into()
+                    };
+                }
+            });
+        }
+        if !self.proxy_status.is_empty() {
+            ui.colored_label(egui::Color32::LIGHT_GREEN, &self.proxy_status);
+        }
+    }
+
+    /// Парсит proxy_input: если это не scheme-URI, пробует base64-подписку (каждая строка — узел).
+    fn parse_proxy_input(&mut self) -> Result<usize, String> {
+        let input = self.proxy_input.trim().to_string();
+        if input.is_empty() {
+            return Err("пустой ввод".into());
+        }
+        let mut items: Vec<(String, String)> = Vec::new();
+        if input.contains("://") || input.starts_with('[') || input.starts_with('{') {
+            let j = nexxrust::proxy_parse::parse_proxy_config(&input, "manual");
+            let v: serde_json::Value = serde_json::from_str(&j).map_err(|e| e.to_string())?;
+            if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+                return Err(v.get("error").and_then(|e| e.as_str()).unwrap_or("parse error").to_string());
+            }
+            items.push((v.get("remarks").or_else(|| v.get("tag")).and_then(|r| r.as_str()).unwrap_or("manual").to_string(), j));
+        } else {
+            // base64-подписка
+            let raw = crypto::base64url_decode(&input)
+                .or_else(|_| crypto::base64_decode(&input))
+                .map_err(|_| "не URI и не base64".to_string())?;
+            let text = String::from_utf8(raw).map_err(|_| "подписка не текст".to_string())?;
+            for (i, line) in text.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let j = nexxrust::proxy_parse::parse_proxy_config(line, &format!("node-{}", i + 1));
+                let v: serde_json::Value = serde_json::from_str(&j).map_err(|e| e.to_string())?;
+                if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+                    let remarks = v.get("remarks").or_else(|| v.get("tag")).and_then(|r| r.as_str()).unwrap_or("").to_string();
+                    items.push((if remarks.is_empty() { format!("node-{}", i + 1) } else { remarks }, j));
+                }
+            }
+        }
+        if items.is_empty() {
+            return Err("ни одного валидного узла".into());
+        }
+        self.proxy_list = items;
+        self.proxy_selected = 0;
+        Ok(self.proxy_list.len())
+    }
+
+    fn health_check_selected(&self) -> String {
+        if self.proxy_list.is_empty() {
+            return "нет узлов".into();
+        }
+        let (_, j) = &self.proxy_list[self.proxy_selected.min(self.proxy_list.len() - 1)];
+        let v: serde_json::Value = match serde_json::from_str(j) {
+            Ok(v) => v,
+            Err(_) => return "битый json узла".into(),
+        };
+        let host = v.get("host").and_then(|h| h.as_str()).unwrap_or("");
+        let port = v.get("port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+        if host.is_empty() || port == 0 {
+            return "в узле нет host/port".into();
+        }
+        let r = nexxrust::control::health_check_tcp(host, port, 3000);
+        if r.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+            format!("✅ {host}:{port} — {} мс", r.get("rtt_ms").and_then(|x| x.as_u64()).unwrap_or(0))
+        } else {
+            format!("❌ {host}:{port} — {}", r.get("error").and_then(|e| e.as_str()).unwrap_or("timeout"))
+        }
+    }
+
+    /// Kill-switch проверка перед любым сетевым действием приложения.
+    fn route_allowed(&self) -> bool {
+        nexxrust::control::route_decision(self.proxy_active, false, false, false, !self.kill_switch) != "block"
     }
 
     /// Вкладка «Контакты» (Этап 2.2): список из шифрованного contact_store +
@@ -522,6 +658,12 @@ impl NeXXUi {
                         ui.label(format!("{}:{}", self.chat_host, self.chat_port));
                     });
                     if ui.button("Подключиться").clicked() {
+                        // Kill-switch (Этап 4.3): без активного прокси при включённом
+                        // kill-switch refuse — никакого прямого трафика.
+                        if !self.route_allowed() {
+                            self.chat_status = "🚫 kill-switch: прокси не активен, прямой трафик заблокирован".into();
+                            return;
+                        }
                         // M6: CA только из конфига; неизвестный хост — отказ, не чужой CA.
                         let Some(ca_pem) = crate::servers::ca_for(&self.chat_host, self.chat_port) else {
                             self.chat_status = format!("неизвестный релей {}:{}", self.chat_host, self.chat_port);
