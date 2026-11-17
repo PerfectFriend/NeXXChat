@@ -316,3 +316,8 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 
 ## 2026-11-17 (аудит-фикс K1): XFTP теперь с обязательным пиннингом
 - `xftp_file.rs`: `connect(host, port, expected: &[[u8;32]], …)` — без trust-set пина отказ; пин any-of constant-time против SHA-256(DER) certs цепочки; X.509 verify best-effort; SNI убран (релей без SNI отдаёт цепочку, чей keyHash принимает). `xftp1_key_hashes()` — trust set (YR2, Root YR, E-series). **XFTP FILE SMOKE OK с пином** (262080B, 4 chunks, roundtrip, FDEL).
+
+
+## 2026-11-17 (аудит-фиксы K1+V1)
+- **K1 закрыт:** XFTP `connect` требует trust-set keyHash (ct_eq any-of, без пина — отказ) + X.509 best-effort; SNI убран (релей без SNI отдаёт принимаемую цепочку). XFTP FILE SMOKE OK с пином; unit 104/104, clippy 0.
+- **V1 закрыт:** все 25 JNI-экспортов `jni_api.rs` обёрнуты в `ffi_guard!` (catch_unwind → JSON-ошибка вместо abort). Теперь 31/31 экспортов под защитой (6 в jni_smp + 25 в jni_api).

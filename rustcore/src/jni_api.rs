@@ -7,6 +7,17 @@ use jni::JNIEnv;
 
 use crate::{bip39, crypto, keytree, proxy_parse};
 
+/// Обёртка FFI: паника → JSON-ошибка вместо abort (аудит H3/V1 — все экспорты jni_api обёрнуты).
+macro_rules! ffi_guard {
+    ($env:expr, $body:expr) => {{
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(s) => s,
+            Err(_) => to_jstring(&mut $env, err_json("внутренняя ошибка (паника перехвачена)")),
+        }
+    }};
+}
+
+
 /// Аудит M8: верхние границы входов через JNI — защита от OOM/DoS
 /// (гигантский nBytes в randomHex, неограниченные строки/KDF-параметры).
 pub const MAX_INPUT_CHARS: usize = 4 << 20; // 4M chars на одну входную строку
@@ -66,9 +77,13 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_parseProxyConfig(
     input: JString,
     remarks: JString,
 ) -> jstring {
-    let input = jstr!(&mut env, input);
-    let remarks = jstr!(&mut env, remarks);
-    to_jstring(&mut env, proxy_parse::parse_proxy_config(&input, &remarks))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let input = jstr!(&mut env, input);
+            let remarks = jstr!(&mut env, remarks);
+            to_jstring(&mut env, proxy_parse::parse_proxy_config(&input, &remarks))
+        })
+    })
 }
 
 /// String sha256Hex(String data)
@@ -78,8 +93,12 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_sha256Hex(
     _class: JClass,
     data: JString,
 ) -> jstring {
-    let s = jstr!(&mut env, data);
-    to_jstring(&mut env, crypto::sha256_hex(s.as_bytes()))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let s = jstr!(&mut env, data);
+            to_jstring(&mut env, crypto::sha256_hex(s.as_bytes()))
+        })
+    })
 }
 
 /// String pbkdf2Hex(String password, String saltHex)
@@ -91,14 +110,18 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_pbkdf2Hex(
     password: JString,
     salt_hex: JString,
 ) -> jstring {
-    let pw = jstr!(&mut env, password);
-    let salt_hex = jstr!(&mut env, salt_hex);
-    let salt = match crypto::hex_decode(&salt_hex) {
-        Some(s) if !s.is_empty() => s,
-        _ => return to_jstring(&mut env, err_json("saltHex: bad or empty hex")),
-    };
-    let dk = crypto::pbkdf2_hmac_sha256(pw.as_bytes(), &salt, PBKDF2_ITERATIONS, PBKDF2_DKLEN);
-    to_jstring(&mut env, crypto::hex_encode(&dk))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let pw = jstr!(&mut env, password);
+            let salt_hex = jstr!(&mut env, salt_hex);
+            let salt = match crypto::hex_decode(&salt_hex) {
+                Some(s) if !s.is_empty() => s,
+                _ => return to_jstring(&mut env, err_json("saltHex: bad or empty hex")),
+            };
+            let dk = crypto::pbkdf2_hmac_sha256(pw.as_bytes(), &salt, PBKDF2_ITERATIONS, PBKDF2_DKLEN);
+            to_jstring(&mut env, crypto::hex_encode(&dk))
+        })
+    })
 }
 
 /// String aesGcmEncryptHex(String keyHex, String dataHex) → hex(iv+ct+tag) или {"error":...}
@@ -109,23 +132,27 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_aesGcmEncryptHex(
     key_hex: JString,
     data_hex: JString,
 ) -> jstring {
-    let key_hex = jstr!(&mut env, key_hex);
-    let data_hex = jstr!(&mut env, data_hex);
-    if data_hex.len() > MAX_DATA_HEX_CHARS {
-        return to_jstring(&mut env, err_json("data too large for AES-GCM input"));
-    }
-    let key = match crypto::hex_decode(&key_hex) {
-        Some(k) if k.len() == 32 => k,
-        _ => return to_jstring(&mut env, r#"{"error":"key must be 32 bytes hex"}"#.into()),
-    };
-    let pt = match crypto::hex_decode(&data_hex) {
-        Some(d) => d,
-        None => return to_jstring(&mut env, r#"{"error":"bad hex data"}"#.into()),
-    };
-    match crypto::aes256_gcm_encrypt(&key, &pt) {
-        Ok(ct) => to_jstring(&mut env, crypto::hex_encode(&ct)),
-        Err(e) => to_jstring(&mut env, format!(r#"{{"error":{}}}"#, serde_json::to_string(&e).unwrap())),
-    }
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let key_hex = jstr!(&mut env, key_hex);
+            let data_hex = jstr!(&mut env, data_hex);
+            if data_hex.len() > MAX_DATA_HEX_CHARS {
+                return to_jstring(&mut env, err_json("data too large for AES-GCM input"));
+            }
+            let key = match crypto::hex_decode(&key_hex) {
+                Some(k) if k.len() == 32 => k,
+                _ => return to_jstring(&mut env, r#"{"error":"key must be 32 bytes hex"}"#.into()),
+            };
+            let pt = match crypto::hex_decode(&data_hex) {
+                Some(d) => d,
+                None => return to_jstring(&mut env, r#"{"error":"bad hex data"}"#.into()),
+            };
+            match crypto::aes256_gcm_encrypt(&key, &pt) {
+                Ok(ct) => to_jstring(&mut env, crypto::hex_encode(&ct)),
+                Err(e) => to_jstring(&mut env, format!(r#"{{"error":{}}}"#, serde_json::to_string(&e).unwrap())),
+            }
+        })
+    })
 }
 
 /// String aesGcmDecryptHex(String keyHex, String dataHex) → hex(plaintext) или {"error":...}
@@ -136,20 +163,24 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_aesGcmDecryptHex(
     key_hex: JString,
     data_hex: JString,
 ) -> jstring {
-    let key_hex = jstr!(&mut env, key_hex);
-    let data_hex = jstr!(&mut env, data_hex);
-    let key = match crypto::hex_decode(&key_hex) {
-        Some(k) if k.len() == 32 => k,
-        _ => return to_jstring(&mut env, r#"{"error":"key must be 32 bytes hex"}"#.into()),
-    };
-    let data = match crypto::hex_decode(&data_hex) {
-        Some(d) => d,
-        None => return to_jstring(&mut env, r#"{"error":"bad hex data"}"#.into()),
-    };
-    match crypto::aes256_gcm_decrypt(&key, &data) {
-        Ok(pt) => to_jstring(&mut env, crypto::hex_encode(&pt)),
-        Err(e) => to_jstring(&mut env, format!(r#"{{"error":{}}}"#, serde_json::to_string(&e).unwrap())),
-    }
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let key_hex = jstr!(&mut env, key_hex);
+            let data_hex = jstr!(&mut env, data_hex);
+            let key = match crypto::hex_decode(&key_hex) {
+                Some(k) if k.len() == 32 => k,
+                _ => return to_jstring(&mut env, r#"{"error":"key must be 32 bytes hex"}"#.into()),
+            };
+            let data = match crypto::hex_decode(&data_hex) {
+                Some(d) => d,
+                None => return to_jstring(&mut env, r#"{"error":"bad hex data"}"#.into()),
+            };
+            match crypto::aes256_gcm_decrypt(&key, &data) {
+                Ok(pt) => to_jstring(&mut env, crypto::hex_encode(&pt)),
+                Err(e) => to_jstring(&mut env, format!(r#"{{"error":{}}}"#, serde_json::to_string(&e).unwrap())),
+            }
+        })
+    })
 }
 
 /// String randomHex(int nBytes) — nBytes кlampeруется в [0, MAX_RANDOM_BYTES] (аудит M8: без upper bound → OOM).
@@ -159,8 +190,12 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_randomHex(
     _class: JClass,
     n: jni::sys::jint,
 ) -> jstring {
-    let bytes = crypto::random_bytes(n.clamp(0, MAX_RANDOM_BYTES) as usize);
-    to_jstring(&mut env, crypto::hex_encode(&bytes))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let bytes = crypto::random_bytes(n.clamp(0, MAX_RANDOM_BYTES) as usize);
+            to_jstring(&mut env, crypto::hex_encode(&bytes))
+        })
+    })
 }
 
 /// String bip39Mnemonic(int entropyBytes) → JSON {"ok":true,"words":[...]}
@@ -170,15 +205,19 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_bip39Mnemonic(
     _class: JClass,
     entropy_bytes: jni::sys::jint,
 ) -> jstring {
-    let n = entropy_bytes as usize;
-    if n != 16 && n != 32 {
-        return to_jstring(&mut env, r#"{"ok":false,"error":"entropy must be 16 or 32"}"#.into());
-    }
-    let ent = crypto::random_bytes(n);
-    match bip39::mnemonic_from_entropy(&ent) {
-        Ok(words) => to_jstring(&mut env, serde_json::json!({"ok":true,"words":words}).to_string()),
-        Err(e) => to_jstring(&mut env, format!(r#"{{"ok":false,"error":{}}}"#, serde_json::to_string(&e).unwrap())),
-    }
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let n = entropy_bytes as usize;
+            if n != 16 && n != 32 {
+                return to_jstring(&mut env, r#"{"ok":false,"error":"entropy must be 16 or 32"}"#.into());
+            }
+            let ent = crypto::random_bytes(n);
+            match bip39::mnemonic_from_entropy(&ent) {
+                Ok(words) => to_jstring(&mut env, serde_json::json!({"ok":true,"words":words}).to_string()),
+                Err(e) => to_jstring(&mut env, format!(r#"{{"ok":false,"error":{}}}"#, serde_json::to_string(&e).unwrap())),
+            }
+        })
+    })
 }
 
 /// boolean bip39Validate(String wordsSpaceSeparated)
@@ -210,16 +249,20 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_bip39SeedHex(
     mnemonic: JString,
     passphrase: JString,
 ) -> jstring {
-    let m = jstr!(&mut env, mnemonic);
-    let p = jstr!(&mut env, passphrase);
-    let salt = format!("mnemonic{p}");
-    let dk = crypto::pbkdf2_hmac_sha256(
-        m.as_bytes(),
-        salt.as_bytes(),
-        BIP39_LEGACY_ITERATIONS,
-        BIP39_LEGACY_DKLEN,
-    );
-    to_jstring(&mut env, crypto::hex_encode(&dk))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let m = jstr!(&mut env, mnemonic);
+            let p = jstr!(&mut env, passphrase);
+            let salt = format!("mnemonic{p}");
+            let dk = crypto::pbkdf2_hmac_sha256(
+                m.as_bytes(),
+                salt.as_bytes(),
+                BIP39_LEGACY_ITERATIONS,
+                BIP39_LEGACY_DKLEN,
+            );
+            to_jstring(&mut env, crypto::hex_encode(&dk))
+        })
+    })
 }
 
 /// String bip39SeedStandardHex(String mnemonic, String passphrase)
@@ -231,10 +274,14 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_bip39SeedStandardHex(
     mnemonic: JString,
     passphrase: JString,
 ) -> jstring {
-    let m = jstr!(&mut env, mnemonic);
-    let p = jstr!(&mut env, passphrase);
-    let seed = bip39::seed_from_mnemonic_standard(&m, &p);
-    to_jstring(&mut env, crypto::hex_encode(&seed))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let m = jstr!(&mut env, mnemonic);
+            let p = jstr!(&mut env, passphrase);
+            let seed = bip39::seed_from_mnemonic_standard(&m, &p);
+            to_jstring(&mut env, crypto::hex_encode(&seed))
+        })
+    })
 }
 
 /// String version() — диагностика: версия библиотеки.
@@ -243,7 +290,11 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_version(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    to_jstring(&mut env, format!("nexxrust {}", env!("CARGO_PKG_VERSION")))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            to_jstring(&mut env, format!("nexxrust {}", env!("CARGO_PKG_VERSION")))
+        })
+    })
 }
 
 // ---------- Opaque seed handles (аудит H7: сид не должен ходить через JNI строкой) ----------
@@ -325,13 +376,17 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyDeriveLabelByHandle(
     handle: jni::sys::jlong,
     label: JString,
 ) -> jstring {
-    let label = jstr!(&mut env, label);
-    let seed = match seed_or_err(&mut env, handle) {
-        Ok(s) => s,
-        Err(j) => return j,
-    };
-    let key = keytree::derive_label(&seed, &label);
-    to_jstring(&mut env, crypto::hex_encode(&key))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let label = jstr!(&mut env, label);
+            let seed = match seed_or_err(&mut env, handle) {
+                Ok(s) => s,
+                Err(j) => return j,
+            };
+            let key = keytree::derive_label(&seed, &label);
+            to_jstring(&mut env, crypto::hex_encode(&key))
+        })
+    })
 }
 
 /// String keyWalletByHandle(long handle, String chain, int index) → JSON.
@@ -343,57 +398,61 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyWalletByHandle(
     chain: JString,
     index: jni::sys::jint,
 ) -> jstring {
-    let chain = jstr!(&mut env, chain);
-    let seed = match seed_or_err(&mut env, handle) {
-        Ok(s) => s,
-        Err(j) => return j,
-    };
-    let idx = index.max(0) as u32;
-    let (path, address) = match chain.as_str() {
-        "eth" => {
-            let p = format!("m/44'/60'/0'/0/{idx}");
-            match keytree::derive_path_secp256k1(&seed, &p) {
-                Some(k) => (p, keytree::eth_address(&k.private)),
-                None => (p, None),
-            }
-        }
-        "btc" => {
-            let p = format!("m/84'/0'/0'/0/{idx}");
-            match keytree::derive_path_secp256k1(&seed, &p) {
-                Some(k) => (p, keytree::btc_bech32_address(&k.private)),
-                None => (p, None),
-            }
-        }
-        "sol" => {
-            let p = format!("m/44'/501'/0'/0'/{idx}'");
-            let addr = keytree::sol_address(&seed, &p);
-            (p, addr)
-        }
-        "smp" => {
-            let p = format!("m/0'/0'/{idx}'");
-            match keytree::derive_path_ed25519(&seed, &p) {
-                Some(k) => {
-                    let sk = ed25519_dalek::SigningKey::from_bytes(&k.private);
-                    let pub_b64 = {
-                        use base64::Engine as _;
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD
-                            .encode(sk.verifying_key().to_bytes())
-                    };
-                    (p, Some(format!("ed25519:{pub_b64}")))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let chain = jstr!(&mut env, chain);
+            let seed = match seed_or_err(&mut env, handle) {
+                Ok(s) => s,
+                Err(j) => return j,
+            };
+            let idx = index.max(0) as u32;
+            let (path, address) = match chain.as_str() {
+                "eth" => {
+                    let p = format!("m/44'/60'/0'/0/{idx}");
+                    match keytree::derive_path_secp256k1(&seed, &p) {
+                        Some(k) => (p, keytree::eth_address(&k.private)),
+                        None => (p, None),
+                    }
                 }
-                None => (p, None),
-            }
-        }
-        _ => (String::new(), None),
-    };
-    let json = serde_json::json!({
-        "ok": address.is_some(),
-        "chain": chain,
-        "index": idx,
-        "path": path,
-        "address": address,
-    });
-    to_jstring(&mut env, json.to_string())
+                "btc" => {
+                    let p = format!("m/84'/0'/0'/0/{idx}");
+                    match keytree::derive_path_secp256k1(&seed, &p) {
+                        Some(k) => (p, keytree::btc_bech32_address(&k.private)),
+                        None => (p, None),
+                    }
+                }
+                "sol" => {
+                    let p = format!("m/44'/501'/0'/0'/{idx}'");
+                    let addr = keytree::sol_address(&seed, &p);
+                    (p, addr)
+                }
+                "smp" => {
+                    let p = format!("m/0'/0'/{idx}'");
+                    match keytree::derive_path_ed25519(&seed, &p) {
+                        Some(k) => {
+                            let sk = ed25519_dalek::SigningKey::from_bytes(&k.private);
+                            let pub_b64 = {
+                                use base64::Engine as _;
+                                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .encode(sk.verifying_key().to_bytes())
+                            };
+                            (p, Some(format!("ed25519:{pub_b64}")))
+                        }
+                        None => (p, None),
+                    }
+                }
+                _ => (String::new(), None),
+            };
+            let json = serde_json::json!({
+                "ok": address.is_some(),
+                "chain": chain,
+                "index": idx,
+                "path": path,
+                "address": address,
+            });
+            to_jstring(&mut env, json.to_string())
+        })
+    })
 }
 
 /// String keyFleetPlanByHandle(long handle, int nodeCount) → JSON.
@@ -404,26 +463,30 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_keyFleetPlanByHandle(
     handle: jni::sys::jlong,
     node_count: jni::sys::jint,
 ) -> jstring {
-    let seed = match seed_or_err(&mut env, handle) {
-        Ok(s) => s,
-        Err(j) => return j,
-    };
-    let count = node_count.clamp(0, 1000) as u32;
-    let plan = keytree::plan_fleet(&seed, count);
-    let nodes: Vec<serde_json::Value> = plan
-        .iter()
-        .map(|n| {
-            serde_json::json!({
-                "index": n.index,
-                "id": n.id,
-                "identityKey": n.identity_key,
-                "storageKey": n.storage_key,
-                "chatKey": n.chat_key,
-            })
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let seed = match seed_or_err(&mut env, handle) {
+                Ok(s) => s,
+                Err(j) => return j,
+            };
+            let count = node_count.clamp(0, 1000) as u32;
+            let plan = keytree::plan_fleet(&seed, count);
+            let nodes: Vec<serde_json::Value> = plan
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "index": n.index,
+                        "id": n.id,
+                        "identityKey": n.identity_key,
+                        "storageKey": n.storage_key,
+                        "chatKey": n.chat_key,
+                    })
+                })
+                .collect();
+            let json = serde_json::json!({"ok": true, "nodes": nodes});
+            to_jstring(&mut env, json.to_string())
         })
-        .collect();
-    let json = serde_json::json!({"ok": true, "nodes": nodes});
-    to_jstring(&mut env, json.to_string())
+    })
 }
 
 // ---------- Control plane (фаза 4) ----------
@@ -468,8 +531,12 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_healthCheckTcp(
     port: jni::sys::jint,
     timeout_ms: jni::sys::jint,
 ) -> jstring {
-    let h = jstr!(&mut env, host);
-    to_jstring(&mut env, crate::control::health_check_tcp(&h, port.max(1) as u16, timeout_ms.max(1) as u32).to_string())
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let h = jstr!(&mut env, host);
+            to_jstring(&mut env, crate::control::health_check_tcp(&h, port.max(1) as u16, timeout_ms.max(1) as u32).to_string())
+        })
+    })
 }
 
 /// String healthCheckSocks5(String proxyHost, int proxyPort, String targetHost, int targetPort, int timeoutMs) → JSON
@@ -483,15 +550,19 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_healthCheckSocks5(
     target_port: jni::sys::jint,
     timeout_ms: jni::sys::jint,
 ) -> jstring {
-    let ph = jstr!(&mut env, proxy_host);
-    let th = jstr!(&mut env, target_host);
-    to_jstring(&mut env, crate::control::health_check_socks5(
-        &ph,
-        proxy_port.max(1) as u16,
-        &th,
-        target_port.max(1) as u16,
-        timeout_ms.max(1) as u32,
-    ).to_string())
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let ph = jstr!(&mut env, proxy_host);
+            let th = jstr!(&mut env, target_host);
+            to_jstring(&mut env, crate::control::health_check_socks5(
+                &ph,
+                proxy_port.max(1) as u16,
+                &th,
+                target_port.max(1) as u16,
+                timeout_ms.max(1) as u32,
+            ).to_string())
+        })
+    })
 }
 
 /// String buildXrayMergedConfig(String userConfig, int localPort, String protocolHint) → JSON {"ok","config"}
@@ -503,9 +574,13 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_buildXrayMergedConfig(
     local_port: jni::sys::jint,
     protocol_hint: JString,
 ) -> jstring {
-    let uc = jstr!(&mut env, user_config);
-    let ph = jstr!(&mut env, protocol_hint);
-    to_jstring(&mut env, crate::control::build_xray_merged_config(&uc, local_port.max(1) as u16, &ph).to_string())
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let uc = jstr!(&mut env, user_config);
+            let ph = jstr!(&mut env, protocol_hint);
+            to_jstring(&mut env, crate::control::build_xray_merged_config(&uc, local_port.max(1) as u16, &ph).to_string())
+        })
+    })
 }
 
 /// String torControlBootstrapProgress(String host, int port, int timeoutMs) → JSON {"ok","progress"}
@@ -517,8 +592,12 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_torControlBootstrapProgre
     port: jni::sys::jint,
     timeout_ms: jni::sys::jint,
 ) -> jstring {
-    let h = jstr!(&mut env, host);
-    to_jstring(&mut env, crate::control::tor_control_bootstrap_progress(&h, port.max(1) as u16, timeout_ms.max(1) as u32).to_string())
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let h = jstr!(&mut env, host);
+            to_jstring(&mut env, crate::control::tor_control_bootstrap_progress(&h, port.max(1) as u16, timeout_ms.max(1) as u32).to_string())
+        })
+    })
 }
 
 /// String routeDecision(boolean proxyUp, boolean torUp, boolean targetOnion, boolean onlyTor, boolean allowNonTor)
@@ -532,13 +611,17 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_routeDecision(
     only_tor: jni::sys::jboolean,
     allow_non_tor: jni::sys::jboolean,
 ) -> jstring {
-    to_jstring(&mut env, crate::control::route_decision(
-        proxy_up != 0,
-        tor_up != 0,
-        target_onion != 0,
-        only_tor != 0,
-        allow_non_tor != 0,
-    ).to_string())
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            to_jstring(&mut env, crate::control::route_decision(
+                proxy_up != 0,
+                tor_up != 0,
+                target_onion != 0,
+                only_tor != 0,
+                allow_non_tor != 0,
+            ).to_string())
+        })
+    })
 }
 
 /// String buildSsLink(String method, String password, String host, int port, String tag)
@@ -552,11 +635,15 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_buildSsLink(
     port: jni::sys::jint,
     tag: JString,
 ) -> jstring {
-    let m = jstr!(&mut env, method);
-    let p = jstr!(&mut env, password);
-    let h = jstr!(&mut env, host);
-    let t = jstr!(&mut env, tag);
-    to_jstring(&mut env, crate::control::build_ss_link(&m, &p, &h, port.max(1) as u16, &t))
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let m = jstr!(&mut env, method);
+            let p = jstr!(&mut env, password);
+            let h = jstr!(&mut env, host);
+            let t = jstr!(&mut env, tag);
+            to_jstring(&mut env, crate::control::build_ss_link(&m, &p, &h, port.max(1) as u16, &t))
+        })
+    })
 }
 
 /// String parseSsLink(String link) → JSON
@@ -566,8 +653,12 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_parseSsLink(
     _class: JClass,
     link: JString,
 ) -> jstring {
-    let l = jstr!(&mut env, link);
-    to_jstring(&mut env, crate::control::parse_ss_link(&l).to_string())
+    ffi_guard!(env, {
+        ffi_guard!(env, {
+            let l = jstr!(&mut env, link);
+            to_jstring(&mut env, crate::control::parse_ss_link(&l).to_string())
+        })
+    })
 }
 
 #[cfg(test)]
