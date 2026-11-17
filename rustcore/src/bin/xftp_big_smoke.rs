@@ -13,7 +13,7 @@ async fn main() {
     let size = 8 * 1024 * 1024;
     let file: Vec<u8> = (0..size as u32).map(|i| ((i * 2654435761) >> 13) as u8).collect();
     let digest = crypto::sha256_raw(&file);
-    println!("upload {size}B ({} chunks)…", (size as usize).div_ceil(CHUNK_PLAIN));
+    println!("upload {size}B ({} chunks)…", size.div_ceil(CHUNK_PLAIN as u32) as usize);
 
     let desc = xftp_file::upload_file(&host, port, &file).await.expect("upload 8MB");
     println!("OK upload: {} chunks", desc.chunks.len());
