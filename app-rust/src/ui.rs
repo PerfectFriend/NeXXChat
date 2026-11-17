@@ -1610,6 +1610,33 @@ impl NeXXUi {
             }
         }
         ui.label("XFTP-релей: xftp1.simplex.im:443 (ALPN xftp/1, пиннинг по keyHash CA в clientHello)");
+        // drag&drop файла в окно — автозаполнение пути и сразу загрузка
+        let dropped = ui.input(|i| i.raw.dropped_files.clone());
+        if let Some(f) = dropped.first() {
+            if let Some(path) = &f.path {
+                self.file_path = path.display().to_string();
+                if self.file_tx.is_none() {
+                    let (ev_tx, ev_rx) = channel::<FileEvent>();
+                    let (cmd_tx, cmd_rx) = channel::<FileCmd>();
+                    self.file_rx = Some(ev_rx);
+                    self.file_tx = Some(cmd_tx);
+                    std::thread::spawn(move || file_worker(ev_tx, cmd_rx));
+                }
+                if let Some(tx) = &self.file_tx {
+                    let _ = tx.send(FileCmd::Upload(self.file_path.clone()));
+                    self.file_status = format!("загрузка перетащенного файла: {}", self.file_path);
+                }
+            }
+        }
+        if ui.input(|i| !i.raw.dropped_files.is_empty() && i.raw.dropped_files[0].path.is_none()) {
+            ui.painter().text(
+                ui.ctx().screen_rect().center(),
+                egui::Align2::CENTER_CENTER,
+                "⬆ отпустите файл для загрузки",
+                egui::FontId::proportional(28.0),
+                egui::Color32::LIGHT_GREEN,
+            );
+        }
         ui.separator();
         ui.strong("Отправка файла:");
         ui.horizontal(|ui| {
