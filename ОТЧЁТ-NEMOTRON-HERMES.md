@@ -276,3 +276,9 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - `rustcore/src/protocols/agent_cmds.rs`: `build_qadd`/`build_quse` (wire-формат SMP agent), `agent_msg_envelope` + hash-chain, `send_agent_msg`/`ack_msg`, `rotate_queue` (NEW q2 + SUB → HELLO→QADD(q2)→QUSE(q2) на старый snd). Unit 2/2.
 - `bin/agent_rotate_lib_smoke.rs`: **ROTATE LIB SMOKE OK** против smp6.simplex.im:5223 — сообщение после ротации принимается на новой очереди q2, q1 удаляется.
 - Тесты **103/103**, clippy **0**.
+
+
+## 2026-11-17 (продолжение 4): групповой чат UI + доставка APK
+- `app-rust/src/ui.rs`: groups_ui переписан в двухпанельный вид (список групп слева, чат выбранной группы справа: история-пузыри из message_store по group_id, ввод снизу -> fan-out send_group_msg на всех member'ов, участники + добавление из контактов). aarch64 .so 16 572 480 Б, 31 JNI.
+- APK 157 514 992 Б доставлен в топик 23616: **SENT id=31769** (через клон session nexx_mtproto_apk.session, т.к. основной session занят джинглами — database is locked).
+- Тесты 103/103, clippy 0.
