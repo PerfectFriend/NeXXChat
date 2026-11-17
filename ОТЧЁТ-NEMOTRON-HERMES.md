@@ -306,3 +306,9 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 ## 2026-11-17 (продолжение 9): Этап 5 — release-сборка Android
 - `app/build.gradle.kts`: release → minify+shrink+proguard (`proguard-rules.pro`: keep native, libv2ray, NativeActivity). `gradle assembleRelease` exit 0 → `app-release-unsigned.apk` 156 449 063 Б (debug 157 514 992 Б).
 - Проверка после proguard: `nm -D` в lib/arm64-v8a — libnexxapp.so **31 JNI**, libgojni.so 28 — не порезаны.
+
+
+## 2026-11-17 (продолжение 10): релизный APK подписан и доставлен
+- `apksigner sign` (debug keystore, для стенда) → `~/apkexport/NeXX-allabi-release.apk` 156 456 114 Б, `apksigner verify` OK (SHA-256 1848346f…).
+- Доставлен в топик 23616 (id в процессе отправки).
+- Debug-APK с подгрузкой истории линка: **SENT id=31780**.
