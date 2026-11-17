@@ -301,3 +301,8 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 
 ## 2026-11-17 (продолжение 8): история 1-1 линка в message_store
 - `app-rust`: входящие/исходящие сообщения 1-1 линка (PeerLink) теперь пишутся в шифрованный `messages.bin` (contact_id = link_peer) через `MessageStore::push` — история переживает рестарт.
+
+
+## 2026-11-17 (продолжение 9): Этап 5 — release-сборка Android
+- `app/build.gradle.kts`: release → minify+shrink+proguard (`proguard-rules.pro`: keep native, libv2ray, NativeActivity). `gradle assembleRelease` exit 0 → `app-release-unsigned.apk` 156 449 063 Б (debug 157 514 992 Б).
+- Проверка после proguard: `nm -D` в lib/arm64-v8a — libnexxapp.so **31 JNI**, libgojni.so 28 — не порезаны.
