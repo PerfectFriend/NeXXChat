@@ -252,3 +252,11 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - Тесты rustcore: **97/97 PASS** (3 прогона подряд), clippy **0 warnings** (flaky FAILED `route_allowed_reflects_kill_switch` в параллельном прогоне не воспроизводится — 3× зелёный).
 - Сборка: 3 ABI × 31 JNI export, libv2ray vendored (libgojni.so ×3 + assets) — `NeXX-allabi-debug.apk` 59 358 946 Б → Telegram topic 23616, **id 31759**.
 - Коммит `82a9dc0`, пуш в `PerfectFriend/NeXXChat` master.
+
+
+## 2026-11-17 (продолжение): Этап 2.2 — 1-1 contact link
+- `rustcore/src/protocols/contact_link.rs`: PeerLink (NEW+SUB, invite_uri, accept_invite, install_peer, send_chat, poll_chat, recv_raw + extract_snd_pub из envelope). Unit 2/2.
+- `rustcore/src/bin/contact_link_smoke.rs`: **CONTACT LINK SMOKE OK** — Alice↔Bob, инвайт → connReq-обмен → чат в обе стороны через smp6.simplex.im:5223 (живой прогон).
+- `app-rust/src/ui.rs`: link_worker + секция «🔗 1-1 линк» в Chats (свой инвайт с копированием, приём инвайта, handshake, чат с peer); kill-switch блокирует линк без прокси.
+- Тесты rustcore **99/99**, clippy **0**. APK (3 ABI, libnexxapp+libgojni+geo assets) собран, в доставке в топик 23616.
+- Коммит `b0d761f` → PerfectFriend/NeXXChat master.
