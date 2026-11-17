@@ -1539,6 +1539,7 @@ dependencies = [
  "log",
  "nexxrust",
  "pollster",
+ "rand",
  "serde_json",
  "wgpu",
  "winit",

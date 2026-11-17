@@ -256,6 +256,9 @@ pub struct NeXXUi {
     groups: Vec<nexxrust::protocols::group_store::GroupRecord>,
     group_name: String,
     groups_status: String,
+    group_selected: usize,
+    group_msg_input: String,
+    member_pick: usize,
     // прокси (Этап 4.3): парсинг конфигов, health-check, kill-switch
     proxy_input: String,
     proxy_list: Vec<(String, String)>, // (remarks, json-конфиг)
@@ -311,6 +314,9 @@ impl NeXXUi {
             groups: vec![],
             group_name: String::new(),
             groups_status: String::new(),
+            group_selected: 0,
+            group_msg_input: String::new(),
+            member_pick: 0,
             proxy_input: String::new(),
             proxy_list: vec![],
             proxy_selected: 0,
@@ -478,12 +484,172 @@ impl NeXXUi {
         ui.separator();
         if self.groups.is_empty() {
             ui.label("Групп пока нет — создайте выше.");
-        }
-        for g in &self.groups {
-            ui.label(format!("👥 {} — id {} — members: {}", g.name, g.id, g.members.len()));
+        } else {
+            let sel = self.group_selected.min(self.groups.len() - 1);
+            egui::ComboBox::from_id_salt("group_pick")
+                .selected_text(format!("{} ({})", self.groups[sel].name, self.groups[sel].members.len()))
+                .show_ui(ui, |ui| {
+                    for (i, g) in self.groups.iter().enumerate() {
+                        ui.selectable_value(&mut self.group_selected, i, format!("{} ({})", g.name, g.members.len()));
+                    }
+                });
+            ui.separator();
+            ui.label("Участники группы:");
+            for m in &self.groups[sel].members {
+                ui.label(format!("  👤 {} @ {}:{} snd={}…", m.contact_id, m.host, m.port, &m.snd_id[..8.min(m.snd_id.len())]));
+            }
+            // добавление member'а из контактов (нужен peer_snd_id после QADD + dh pub из connReq)
+            if !self.contacts.is_empty() {
+                ui.horizontal(|ui| {
+                    let mp = self.member_pick.min(self.contacts.len() - 1);
+                    egui::ComboBox::from_id_salt("member_pick")
+                        .selected_text(self.contacts[mp].name.clone())
+                        .show_ui(ui, |ui| {
+                            for (i, c) in self.contacts.iter().enumerate() {
+                                ui.selectable_value(&mut self.member_pick, i, c.name.clone());
+                            }
+                        });
+                    if ui.button("➕ В группу").clicked() {
+                        self.groups_status = self.add_contact_to_group(sel, mp);
+                    }
+                });
+            }
+            ui.separator();
+            ui.label("Сообщение в группу (fan-out per-member E2E):");
+            ui.text_edit_singleline(&mut self.group_msg_input);
+            if ui.button("📨 Отправить в группу").clicked() {
+                self.groups_status = self.send_group_msg(sel);
+            }
         }
         if !self.groups_status.is_empty() {
             ui.colored_label(egui::Color32::LIGHT_GREEN, &self.groups_status);
+        }
+    }
+
+    /// Добавляет контакт в выбранную группу как member (нужны peer_snd_id и dh pub).
+    fn add_contact_to_group(&mut self, gi: usize, ci: usize) -> String {
+        use nexxrust::protocols::group_store::{GroupMember, GroupStore};
+        let c = match self.contacts.get(ci) {
+            Some(c) => c.clone(),
+            None => return "нет такого контакта".into(),
+        };
+        if c.peer_snd_id.is_empty() {
+            return "⚠ у контакта ещё нет peer_snd_id (нужен обмен очередями QADD)".into();
+        }
+        let dh_raw = crypto::hex_decode(&c.peer_pub)
+            .and_then(|der| nexxrust::protocols::smp::parse_x25519_x509(&der).map(|k| k.to_vec()));
+        let dh_pub = match dh_raw {
+            Some(k) => crypto::hex_encode(&k),
+            None => return "⚠ peer_pub не x25519".into(),
+        };
+        let path = std::path::PathBuf::from(format!("{}/groups.bin", data_dir()));
+        let mut st = match GroupStore::open(&path, &self.seed) {
+            Ok(s) => s,
+            Err(e) => return format!("⚠ {e}"),
+        };
+        let g = match st.groups().get(gi).cloned() {
+            Some(g) => g,
+            None => return "группа не найдена".into(),
+        };
+        if g.members.iter().any(|m| m.contact_id == c.id) {
+            return "⚠ контакт уже в группе".into();
+        }
+        let mut g = g;
+        g.members.push(GroupMember {
+            contact_id: c.id.clone(),
+            host: c.host.clone(),
+            port: c.port,
+            snd_id: c.peer_snd_id.clone(),
+            dh_pub,
+        });
+        match st.upsert(g) {
+            Ok(()) => {
+                self.groups = st.groups().to_vec();
+                format!("✅ {} добавлен в группу", c.name)
+            }
+            Err(e) => format!("⚠ {e}"),
+        }
+    }
+
+    /// Fan-out группового сообщения: per-member E2E (eph × member dh) в очередь member'а.
+    fn send_group_msg(&mut self, gi: usize) -> String {
+        use nexxrust::protocols::group_store::{encode_group_msg, GroupMsg};
+        use nexxrust::protocols::smp;
+        use nexxrust::protocols::smp_client::SmpClient;
+        use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
+        let text = self.group_msg_input.trim().to_string();
+        if text.is_empty() {
+            return "⚠ пустое сообщение".into();
+        }
+        let g = match self.groups.get(gi).cloned() {
+            Some(g) => g,
+            None => return "группа не найдена".into(),
+        };
+        if g.members.is_empty() {
+            return "⚠ в группе нет участников".into();
+        }
+        // kill-switch: без прокси при включённом kill-switch — refuse
+        if !self.route_allowed() {
+            return "🚫 kill-switch: прокси не активен".into();
+        }
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let msg = GroupMsg {
+            v: "nexx/group/v1".into(),
+            group_id: g.id.clone(),
+            from_contact: "me".into(),
+            ts,
+            body_b64: crypto::base64url_encode(text.as_bytes()),
+        };
+        let plain = match encode_group_msg(&msg) {
+            Ok(p) => p,
+            Err(e) => return format!("⚠ {e}"),
+        };
+        let mut ok = 0usize;
+        let mut last_err = String::new();
+        for m in &g.members {
+            let dh_bytes = match crypto::hex_decode(&m.dh_pub) {
+                Some(b) if b.len() == 32 => {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    a
+                }
+                _ => {
+                    last_err = format!("member {} dh_pub не 32 байта", m.contact_id);
+                    continue;
+                }
+            };
+            let snd_id = match crypto::hex_decode(&m.snd_id) {
+                Some(b) => b,
+                None => {
+                    last_err = format!("member {} snd_id не hex", m.contact_id);
+                    continue;
+                }
+            };
+            let ca = crate::servers::ca_for(&m.host, m.port);
+            let mut client = match SmpClient::connect_openssl_with_ca(&m.host, m.port, ca.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("{}:{} connect: {e}", m.host, m.port);
+                    continue;
+                }
+            };
+            let mut eph_b = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut eph_b);
+            let eph = StaticSecret::from(eph_b);
+            let e2e = eph.diffie_hellman(&X25519Public::from(dh_bytes));
+            let eph_x = smp::x25519_x509(X25519Public::from(&eph).as_bytes());
+            let mut body = vec![b'_'];
+            body.extend_from_slice(&plain);
+            match client.send_message(&snd_id, e2e.as_bytes(), Some(&eph_x), &body, b"") {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = format!("{}:{} SEND: {e}", m.host, m.port),
+            }
+        }
+        if ok > 0 {
+            self.group_msg_input.clear();
+            format!("✅ отправлено участникам: {ok}/{} мест", g.members.len())
+        } else {
+            format!("❌ никому не ушло: {last_err}")
         }
     }
 
