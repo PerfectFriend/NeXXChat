@@ -15,16 +15,16 @@ async fn main() {
     let digest = crypto::sha256_raw(&file);
     println!("upload {size}B ({} chunks)…", size.div_ceil(CHUNK_PLAIN));
 
-    let desc = xftp_file::upload_file(&host, port, &file).await.expect("upload 8MB");
+    let desc = xftp_file::upload_file(&host, port, &xftp_file::xftp1_key_hashes(), &file).await.expect("upload 8MB");
     println!("OK upload: {} chunks", desc.chunks.len());
     let link = desc.encode();
     let desc2 = xftp_file::FileDesc::decode(&link).expect("decode link");
 
-    let got = xftp_file::download_file(&desc2).await.expect("download 8MB");
+    let got = xftp_file::download_file(&desc2, &xftp_file::xftp1_key_hashes()).await.expect("download 8MB");
     assert_eq!(got.len(), size, "size mismatch");
     assert_eq!(crypto::sha256_raw(&got), digest, "SHA-256 mismatch");
     println!("OK download: {size}B, SHA-256 match");
 
-    xftp_file::delete_file(&desc2).await.expect("FDEL");
+    xftp_file::delete_file(&desc2, &xftp_file::xftp1_key_hashes()).await.expect("FDEL");
     println!("=== XFTP BIG (8MB) SMOKE OK: {} chunks, link roundtrip, FDEL ===", desc.chunks.len());
 }

@@ -10,7 +10,7 @@ async fn main() {
 
     let file: Vec<u8> = (0..4 * CHUNK_PLAIN as u32).map(|i| (i % 251) as u8).collect();
     println!("upload {}B…", file.len());
-    let desc = xftp_file::upload_file(&host, port, &file).await.expect("upload");
+    let desc = xftp_file::upload_file(&host, port, &xftp_file::xftp1_key_hashes(), &file).await.expect("upload");
     println!("OK upload: {} chunks", desc.chunks.len());
 
     let link = desc.encode();
@@ -19,11 +19,11 @@ async fn main() {
     assert_eq!(desc2.size, file.len());
 
     println!("download…");
-    let got = xftp_file::download_file(&desc2).await.expect("download");
+    let got = xftp_file::download_file(&desc2, &xftp_file::xftp1_key_hashes()).await.expect("download");
     assert_eq!(got, file, "content mismatch");
     println!("OK download: {}B, SHA512 match", got.len());
 
-    xftp_file::delete_file(&desc2).await.expect("FDEL");
+    xftp_file::delete_file(&desc2, &xftp_file::xftp1_key_hashes()).await.expect("FDEL");
     println!("OK FDEL all chunks");
     println!("=== XFTP FILE SMOKE OK ({}B, {} chunks, link roundtrip) ===", file.len(), desc.chunks.len());
 }

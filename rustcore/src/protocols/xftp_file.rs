@@ -220,8 +220,12 @@ async fn post(h2: &mut h2::client::SendRequest<Bytes>, body: Bytes, authority: &
 }
 
 impl XftpConn {
-    async fn connect(host: &str, port: u16) -> Result<Self, String> {
+    /// TLS1.3 + ALPN xftp/1 + обязательный пиннинг: expected_key_hash сравнивается
+    /// constant-time с SHA-256(CA из предъявленной цепочки); при наличии ca_pem цепочка
+    /// дополнительно валидируется через X509Store (как в SMP, C1). Без пина — отказ (K1).
+    async fn connect(host: &str, port: u16, expected: &[[u8; 32]], _ca_pem: Option<&str>) -> Result<Self, String> {
         let mut builder = SslConnector::builder(SslMethod::tls()).map_err(|e| e.to_string())?;
+
         builder.set_min_proto_version(Some(SslVersion::TLS1_3)).map_err(|e| e.to_string())?;
         builder
             .set_sigalgs_list("ed448:ed25519:ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512")
@@ -232,6 +236,7 @@ impl XftpConn {
         let connector = builder.build();
         let tcp = tokio::net::TcpStream::connect((host, port)).await.map_err(|e| format!("tcp: {e}"))?;
         let mut ssl_obj = openssl::ssl::Ssl::new(connector.context()).map_err(|e| e.to_string())?;
+        ssl_obj.set_hostname(host).map_err(|e| format!("sni: {e}"))?;
         ssl_obj.set_alpn_protos(b"\x06xftp/1").map_err(|e| e.to_string())?;
         let mut ssl = tokio_openssl::SslStream::new(ssl_obj, tcp).map_err(|e| e.to_string())?;
         {
@@ -246,6 +251,36 @@ impl XftpConn {
         let fin_len = ssl.ssl().finished(&mut fin_buf);
         let session_id = fin_buf[..fin_len].to_vec();
         let chain = ssl.ssl().peer_cert_chain().ok_or("no peer chain")?;
+        let chain_ders: Vec<Vec<u8>> = chain.iter().filter_map(|c| c.to_der().ok()).collect();
+        if std::env::var("NEXX_DEBUG").is_ok() {
+            for d in &chain_ders { eprintln!("chain cert sha256: {}", hex::encode(sha2::Sha256::digest(d))); }
+            for p in expected { eprintln!("expected pin: {}", hex::encode(p)); }
+        }
+        let leaf_der = chain_ders.first().ok_or("empty chain")?.clone();
+        // K1: хотя бы один cert цепочки должен совпасть с пином (constant-time), затем —
+        // настоящая валидация X.509: store = все доверенные CA из trust set, leaf проверяется против них.
+        use openssl::stack::Stack;
+        use openssl::x509::store::X509StoreBuilder;
+        use openssl::x509::{X509, X509StoreContext};
+        let pinned = expected.iter().any(|pin| chain_ders.iter().any(|d| crate::protocols::smp_client::ct_eq(&sha2::Sha256::digest(d), pin)));
+        if expected.is_empty() || !pinned {
+            return Err("XFTP K1: в цепочке нет CA с закреплённым keyHash (MITM?)".into());
+        }
+        let leaf = X509::from_der(&leaf_der).map_err(|e| format!("leaf: {e}"))?;
+        let mut builder = X509StoreBuilder::new().map_err(|e| format!("store: {e}"))?;
+        for pem in [include_str!("../../assets/xftp1-443-ca.pem"), include_str!("../../assets/xftp1-443-ca2.pem")] {
+            for c in X509::stack_from_pem(pem.as_bytes()).map_err(|e| e.to_string())? {
+                let _ = builder.add_cert(c);
+            }
+        }
+        let store = builder.build();
+        let mut untrusted = Stack::new().map_err(|e| e.to_string())?;
+        for d in &chain_ders[1..] { if let Ok(c) = X509::from_der(d) { let _ = untrusted.push(c); } }
+        let mut ctx = X509StoreContext::new().map_err(|e| e.to_string())?;
+        let verified = ctx.init(&store, &leaf, &untrusted, |c| c.verify_cert()).map_err(|e| format!("verify: {e}"))?;
+        if !verified {
+            return Err("XFTP K1: цепочка не подтверждена доверенным CA (MITM?)".into());
+        }
         let ca_der = chain.iter().last().ok_or("no CA in chain")?.to_der().map_err(|e| e.to_string())?;
         let key_hash: [u8; 32] = sha2::Sha256::digest(&ca_der).into();
         let (h2, conn) = h2::client::handshake(ssl).await.map_err(|e| format!("h2: {e}"))?;
@@ -294,9 +329,23 @@ impl XftpConn {
     }
 }
 
+/// keyHash (SHA-256 cert DER) доверенных CA публичного XFTP-релея xftp1.simplex.im:443.
+/// Релей отдаёт разные LE-цепочки (YR2 / E-series) — trust set, any-of в connect (K1).
+pub fn xftp1_key_hashes() -> Vec<[u8; 32]> {
+    let mut out = Vec::new();
+    for pem in [include_str!("../../assets/xftp1-443-ca.pem"), include_str!("../../assets/xftp1-443-ca2.pem")] {
+        if let Ok(stack) = openssl::x509::X509::stack_from_pem(pem.as_bytes()) {
+            if let Some(ca) = stack.into_iter().next() {
+                if let Ok(der) = ca.to_der() { out.push(sha2::Sha256::digest(&der).into()); }
+            }
+        }
+    }
+    out
+}
+
 /// Загружает файл chunked'ами на XFTP-релей. Возвращает FileDesc ("ссылку" для собеседника).
-pub async fn upload_file(host: &str, port: u16, data: &[u8]) -> Result<FileDesc, String> {
-    let mut c = XftpConn::connect(host, port).await?;
+pub async fn upload_file(host: &str, port: u16, expected: &[[u8; 32]], data: &[u8]) -> Result<FileDesc, String> {
+    let mut c = XftpConn::connect(host, port, expected, None).await?;
     let file_key: [u8; 32] = crypto::random_bytes(32).try_into().map_err(|_| "rng")?;
     let file_nonce: [u8; 24] = crypto::random_bytes(24).try_into().map_err(|_| "rng")?;
     let file_sha512 = sha2::Sha512::digest(data).to_vec();
@@ -371,8 +420,8 @@ pub async fn upload_file(host: &str, port: u16, data: &[u8]) -> Result<FileDesc,
 }
 
 /// Скачивает файл по FileDesc и проверяет whole-file SHA512.
-pub async fn download_file(desc: &FileDesc) -> Result<Vec<u8>, String> {
-    let mut c = XftpConn::connect(&desc.host, desc.port).await?;
+pub async fn download_file(desc: &FileDesc, expected: &[[u8; 32]]) -> Result<Vec<u8>, String> {
+    let mut c = XftpConn::connect(&desc.host, desc.port, expected, None).await?;
     let mut assembled = Vec::with_capacity(desc.size);
     for (ci, ch) in desc.chunks.iter().enumerate() {
         let rcv = SigningKey::from_bytes(&ch.rcv_sec);
@@ -417,8 +466,8 @@ pub async fn download_file(desc: &FileDesc) -> Result<Vec<u8>, String> {
 }
 
 /// Удаляет все chunk'и файла (FDEL от имени отправителя).
-pub async fn delete_file(desc: &FileDesc) -> Result<(), String> {
-    let mut c = XftpConn::connect(&desc.host, desc.port).await?;
+pub async fn delete_file(desc: &FileDesc, expected: &[[u8; 32]]) -> Result<(), String> {
+    let mut c = XftpConn::connect(&desc.host, desc.port, expected, None).await?;
     for ch in &desc.chunks {
         let snd = SigningKey::from_bytes(&ch.snd_sec);
         let r = c.cmd(&ch.sender_id, b"FDEL", Some(&snd)).await?;

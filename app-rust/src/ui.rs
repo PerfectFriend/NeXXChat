@@ -162,7 +162,7 @@ fn file_worker(ev: Sender<FileEvent>, cmd: Receiver<FileCmd>) {
                     Err(e) => { say(FileEvent::Err(format!("read: {e}"))); continue; }
                 };
                 say(FileEvent::Status(format!("upload {}B chunked…", data.len())));
-                let r = rt.block_on(xftp_file::upload_file("xftp1.simplex.im", 443, &data));
+                let r = rt.block_on(xftp_file::upload_file("xftp1.simplex.im", 443, &xftp_file::xftp1_key_hashes(), &data));
                 match r {
                     Ok(desc) => {
                         let link = desc.encode();
@@ -175,7 +175,7 @@ fn file_worker(ev: Sender<FileEvent>, cmd: Receiver<FileCmd>) {
             FileCmd::Download(link) => {
                 let r = rt.block_on(async move {
                     let desc = xftp_file::FileDesc::decode(&link)?;
-                    let data = xftp_file::download_file(&desc).await?;
+                    let data = xftp_file::download_file(&desc, &xftp_file::xftp1_key_hashes()).await?;
                     Ok::<_, String>((desc, data))
                 });
                 match r {
