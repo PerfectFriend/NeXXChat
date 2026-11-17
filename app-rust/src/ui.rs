@@ -157,9 +157,18 @@ fn file_worker(ev: Sender<FileEvent>, cmd: Receiver<FileCmd>) {
             FileCmd::Quit => break,
             FileCmd::Upload(path) => {
                 say(FileEvent::Status(format!("читаю {path}…")));
-                let data = match std::fs::read(&path) {
-                    Ok(d) => d,
-                    Err(e) => { say(FileEvent::Err(format!("read: {e}"))); continue; }
+                // N5: лимит размера — не читаем файл целиком в память без предела
+                const MAX_FILE: u64 = 512 * 1024 * 1024;
+                let data = match std::fs::metadata(&path) {
+                    Ok(md) if md.len() > MAX_FILE => {
+                        say(FileEvent::Err(format!("N5: файл {} МБ > лимита {} МБ", md.len() / 1048576, MAX_FILE / 1048576)));
+                        continue;
+                    }
+                    Ok(_) => match std::fs::read(&path) {
+                        Ok(d) => d,
+                        Err(e) => { say(FileEvent::Err(format!("read: {e}"))); continue; }
+                    },
+                    Err(e) => { say(FileEvent::Err(format!("stat: {e}"))); continue; }
                 };
                 say(FileEvent::Status(format!("upload {}B chunked…", data.len())));
                 let r = rt.block_on(xftp_file::upload_file("xftp1.simplex.im", 443, &xftp_file::xftp1_key_hashes(), &data));

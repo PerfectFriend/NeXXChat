@@ -69,12 +69,9 @@ impl PeerLink {
         })
     }
 
-    fn srv_secret(&self) -> [u8; 32] {
-        self.dh
-            .diffie_hellman(&X25519Public::from(
-                smp::parse_x25519_x509(&self.ids.srv_dh_x509).ok_or("bad srv dh").unwrap(),
-            ))
-            .to_bytes()
+    fn srv_secret(&self) -> Result<[u8; 32], String> {
+        let srv_dh = smp::parse_x25519_x509(&self.ids.srv_dh_x509).ok_or("bad srv dh (N4: не паника")?;
+        Ok(self.dh.diffie_hellman(&X25519Public::from(srv_dh)).to_bytes())
     }
 
     /// connReqData с нашей очередью — для раздачи инвайтом.
@@ -123,7 +120,7 @@ impl PeerLink {
         loop {
             for cmd in self.client.take_pending() {
                 if let Ok(m) = smp::parse_msg(&cmd) {
-                    let rcv = smp::decrypt_rcv_msg(&self.srv_secret(), &m.msg_id, &m.body)
+                    let rcv = smp::decrypt_rcv_msg(&self.srv_secret()?, &m.msg_id, &m.body)
                         .map_err(|e| format!("srv decrypt: {e}"))?;
                     let e2e = self.recv_e2e.ok_or("recv_e2e не установлен")?;
                     let (_ph, plain) = smp::decrypt_client_msg(&e2e, &rcv.envelope)
@@ -140,7 +137,7 @@ impl PeerLink {
                 Ok(items) => {
                     for (_a, _c, _e, cmd) in items {
                         if let Ok(m) = smp::parse_msg(&cmd) {
-                            let rcv = smp::decrypt_rcv_msg(&self.srv_secret(), &m.msg_id, &m.body)
+                            let rcv = smp::decrypt_rcv_msg(&self.srv_secret()?, &m.msg_id, &m.body)
                                 .map_err(|e| format!("srv decrypt: {e}"))?;
                             let e2e = self.recv_e2e.ok_or("recv_e2e не установлен")?;
                             let (_ph, plain) = smp::decrypt_client_msg(&e2e, &rcv.envelope)
@@ -241,7 +238,7 @@ impl PeerLink {
             for cmd in cmds.drain(..) {
                 if let Ok(m) = smp::parse_msg(&cmd) {
                     progressed = true;
-                    let rcv = match smp::decrypt_rcv_msg(&self.srv_secret(), &m.msg_id, &m.body) {
+                    let rcv = match smp::decrypt_rcv_msg(&self.srv_secret()?, &m.msg_id, &m.body) {
                         Ok(r) => r,
                         Err(_) => { let _ = self.client.ack(&self.ids.rcv_id, &self.auth, &m.msg_id); continue; }
                     };
@@ -278,15 +275,15 @@ impl PeerLink {
     }
 
     /// Секрет srv-слоя (для ручного парсинга входящих).
-    pub fn srv_secret_pub(&self) -> [u8; 32] {
-        self.srv_secret()
+    pub fn srv_secret_pub(&self) -> Option<[u8; 32]> {
+        self.srv_secret().ok()
     }
 
     /// Парсит одно входящее MSG «вручную»: (msg_id, snd_eph_pub, body),
     /// эфемерный ключ отправителя извлекается из envelope (SPKI-префикс X25519).
     pub fn parse_incoming_raw(&mut self, cmd: &[u8]) -> Option<RawMsg> {
         let m = smp::parse_msg(cmd).ok()?;
-        let srv = self.srv_secret();
+        let srv = self.srv_secret().ok()?;
         let rcv = smp::decrypt_rcv_msg(&srv, &m.msg_id, &m.body).ok()?;
         let snd_pub = extract_snd_pub(&rcv.envelope)?;
         let e2e = self.dh.diffie_hellman(&X25519Public::from(snd_pub)).to_bytes();

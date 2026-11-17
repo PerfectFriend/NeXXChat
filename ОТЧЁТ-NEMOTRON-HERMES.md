@@ -325,3 +325,9 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 
 ## 2026-11-17 (аудит-фикс S2)
 - `proxy_runtime.rs`: лимит 256 одновременных CONNECT (счётчик, лишние закрываются сразу) + `connect_timeout(15s)` и для direct, и для upstream (resolve_one с таймаутом, без блокирующего DNS). Тесты proxy_runtime 4/4, всего 104/104, clippy 0.
+
+
+## 2026-11-17 (аудит-фиксы N4/N5/S1)
+- **S1:** `.so` убран из git-трекинга (генерятся сборкой), `LIBV2RAY.sha256` зафиксирован.
+- **N4:** `contact_link.rs::srv_secret` вместо unwrap → Result/Option, паники на malformed-ответе нет. 104/104, clippy 0.
+- **N5:** лимит файла 512 МБ перед чтением в память в file_worker (UI).
