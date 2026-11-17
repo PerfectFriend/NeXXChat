@@ -287,3 +287,8 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 ## 2026-11-17 (продолжение 5): превью медиа в 📎 Файлы
 - `app-rust`: добавлен `image` crate (png/jpeg/webp/gif/bmp); после `FileEvent::Saved` для картинок — inline-превью через `ctx().load_texture` (масштаб ≤ 420px). aarch64 `.so` 17 298 968 Б, 31 JNI.
 - APK с превью — сборка в фоне, доставка в топик 23616 следом.
+
+
+## 2026-11-17 (продолжение 6): XFTP файлы >4MB + drag&drop
+- `bin/xftp_big_smoke.rs`: **XFTP BIG (8MB) SMOKE OK** vs xftp1.simplex.im:443 — 129 chunk'ей по 64KB, upload→link roundtrip→download (SHA-256 match)→FDEL. Лимита 4MB у релея нет.
+- UI 📎 Файлы: drag&drop файла в окно = сразу загрузка на XFTP.
