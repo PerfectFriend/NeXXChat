@@ -34,6 +34,10 @@ pub struct QueueRecord {
     pub host: String,
     /// Порт релея.
     pub port: u16,
+    /// X.509 X25519 публичный ключ сервера для этой очереди (hex, из IDS) —
+    /// нужен для снятия серверного слоя шифрования при приёме на существующей очереди.
+    #[serde(default)]
+    pub srv_dh_pub: String,
 }
 
 /// Файл хранилища (зашифрованный).
@@ -214,6 +218,7 @@ mod tests {
                 label: "alice".into(),
                 host: "smp6.simplex.im".into(),
                 port: 5223,
+                srv_dh_pub: String::new(),
             })
             .unwrap();
         }

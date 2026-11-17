@@ -19,6 +19,18 @@ fn data_dir() -> String {
         .unwrap_or_else(|_| "/data/data/chat.nexx.app/files".to_string())
 }
 
+/// Достаёт эфемерный x25519-публичный ключ отправителя из SMP-конверта
+/// (формат: u16 version, u8 tag '1', u16 len, DER x509) — нужен для E2E DH
+/// до вызова decrypt_client_msg.
+fn env_eph(envelope: &[u8]) -> Option<[u8; 32]> {
+    if envelope.len() < 5 || envelope[2] != b'1' {
+        return None;
+    }
+    let len = u16::from_be_bytes([envelope[3], envelope[4]]) as usize;
+    let der = envelope.get(5..5 + len)?;
+    nexxrust::protocols::smp::parse_x25519_x509(der)
+}
+
 /// Путь зашифрованного хранилища очередей (стандартная директория данных приложения).
 fn queue_store_path() -> String {
     format!("{}/queues.bin", data_dir())
@@ -120,6 +132,7 @@ fn chat_worker(
             label: label.clone(),
             host: host.clone(),
             port,
+            srv_dh_pub: crypto::hex_encode(&ids.srv_dh_x509),
         }) {
             say(ChatEvent::Err(format!("queue store save: {e}")));
         }
@@ -517,8 +530,26 @@ impl NeXXUi {
             ui.separator();
             ui.label("Сообщение в группу (fan-out per-member E2E):");
             ui.text_edit_singleline(&mut self.group_msg_input);
-            if ui.button("📨 Отправить в группу").clicked() {
-                self.groups_status = self.send_group_msg(sel);
+            ui.horizontal(|ui| {
+                if ui.button("📨 Отправить в группу").clicked() {
+                    self.groups_status = self.send_group_msg(sel);
+                }
+                if ui.button("🔄 Принять сообщения групп").clicked() {
+                    self.groups_status = self.recv_group_msgs();
+                }
+            });
+            // история выбранной группы из message_store
+            let path = std::path::PathBuf::from(format!("{}/messages.bin", data_dir()));
+            if let Ok(st) = nexxrust::protocols::message_store::MessageStore::open(&path, &self.seed) {
+                let hist = st.history(&self.groups[sel].id);
+                if !hist.is_empty() {
+                    ui.label("История группы:");
+                    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                        for m in hist.iter().rev().take(20) {
+                            ui.label(format!("{} {}", if m.outgoing { "➡" } else { "⬅" }, m.body));
+                        }
+                    });
+                }
             }
         }
         if !self.groups_status.is_empty() {
@@ -571,7 +602,118 @@ impl NeXXUi {
         }
     }
 
-    /// Fan-out группового сообщения: per-member E2E (eph × member dh) в очередь member'а.
+    /// Приём групповых сообщений: poll всех своих очередей, два слоя шифрования,
+    /// фильтр по group_id известных групп, запись в message_store, ACK.
+    fn recv_group_msgs(&mut self) -> String {
+        use nexxrust::protocols::group_store::decode_group_msg;
+        use nexxrust::protocols::message_store::{ChatMessage, MessageStore};
+        use nexxrust::protocols::queue_store::{derive_queue_keys, QueueStore};
+        use nexxrust::protocols::smp;
+        use nexxrust::protocols::smp_client::SmpClient;
+        use x25519_dalek::PublicKey as X25519Public;
+        if self.seed.is_empty() {
+            return "⚠ нет сида".into();
+        }
+        if !self.route_allowed() {
+            return "🚫 kill-switch: прокси не активен".into();
+        }
+        let qpath = std::path::PathBuf::from(format!("{}/queues.bin", data_dir()));
+        let store = match QueueStore::open(&qpath, &self.seed) {
+            Ok(s) => s,
+            Err(e) => return format!("⚠ queue store: {e}"),
+        };
+        let group_ids: Vec<String> = self.groups.iter().map(|g| g.id.clone()).collect();
+        let mut got = 0usize;
+        let mut errs = Vec::new();
+        for rec in store.records() {
+            let keys = match derive_queue_keys(&self.seed, rec.index) {
+                Ok(k) => k,
+                Err(e) => {
+                    errs.push(format!("{}: keys {e}", rec.label));
+                    continue;
+                }
+            };
+            let ca = crate::servers::ca_for(&rec.host, rec.port);
+            let mut client = match SmpClient::connect_openssl_with_ca(&rec.host, rec.port, ca.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    errs.push(format!("{}:{} connect {e}", rec.host, rec.port));
+                    continue;
+                }
+            };
+            let rcv_id = match crypto::hex_decode(&rec.rcv_id) {
+                Some(b) => b,
+                None => continue,
+            };
+            let srv_dh = crypto::hex_decode(&rec.srv_dh_pub)
+                .and_then(|der| smp::parse_x25519_x509(&der).map(|k| k.to_vec()));
+            let srv_key = match srv_dh {
+                Some(sp) => keys.dh.diffie_hellman(&X25519Public::from(<[u8; 32]>::try_from(sp.as_slice()).unwrap_or([0u8; 32]))),
+                None => {
+                    errs.push(format!("{}: нет srv_dh_pub", rec.label));
+                    continue;
+                }
+            };
+            if client.subscribe(&rcv_id, &keys.auth).is_err() {
+                continue;
+            }
+            client.set_poll_timeout(std::time::Duration::from_millis(400));
+            for _ in 0..12 {
+                // сначала pending (MSG в том же batch, что и ответ на SUB/ACK)
+                let pend = client.take_pending();
+                let items = match client.recv_transmissions() {
+                    Ok(it) => it,
+                    Err(_) => vec![],
+                };
+                let had_pending = !pend.is_empty();
+                let mut all: Vec<Vec<u8>> = pend;
+                all.extend(items.into_iter().map(|(_a, _c, _e, cmd)| cmd));
+                for cmd in all {
+                    let Ok(m) = smp::parse_msg(&cmd) else { continue };
+                    let Ok(rcv) = smp::decrypt_rcv_msg(srv_key.as_bytes(), &m.msg_id, &m.body) else { continue };
+                    // e2e ключ = наш dh × эфемерный ключ отправителя из конверта
+                    let Ok((env, plain)) = smp::decrypt_client_msg(&{
+                        let eph_pub = env_eph(&rcv.envelope);
+                        match eph_pub {
+                            Some(p) => keys.dh.diffie_hellman(&X25519Public::from(p)),
+                            None => continue,
+                        }
+                    }.as_bytes(), &rcv.envelope) else { continue };
+                    let _ = env;
+                    let Ok((_ph, body)) = smp::parse_priv_header(&plain) else { continue };
+                    if let Ok(gm) = decode_group_msg(body) {
+                        if group_ids.contains(&gm.group_id) {
+                            let body_text = crypto::base64_decode(&gm.body_b64)
+                                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                                .unwrap_or_default();
+                            let mpath = std::path::PathBuf::from(format!("{}/messages.bin", data_dir()));
+                            if let Ok(mut ms) = MessageStore::open(&mpath, &self.seed) {
+                                let _ = ms.push(ChatMessage {
+                                    contact_id: gm.group_id.clone(),
+                                    outgoing: false,
+                                    body: body_text,
+                                    ts: gm.ts,
+                                });
+                            }
+                            got += 1;
+                        }
+                    }
+                    let _ = client.ack(&rcv_id, &keys.auth, &m.msg_id);
+                }
+                if had_pending {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+        }
+        if got > 0 {
+            format!("✅ принято групповых сообщений: {got}")
+        } else if errs.is_empty() {
+            "Групповых сообщений нет".into()
+        } else {
+            format!("⚠ {}", errs.join("; "))
+        }
+    }
     fn send_group_msg(&mut self, gi: usize) -> String {
         use nexxrust::protocols::group_store::{encode_group_msg, GroupMsg};
         use nexxrust::protocols::smp;
