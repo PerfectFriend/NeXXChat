@@ -331,3 +331,7 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - **S1:** `.so` убран из git-трекинга (генерятся сборкой), `LIBV2RAY.sha256` зафиксирован.
 - **N4:** `contact_link.rs::srv_secret` вместо unwrap → Result/Option, паники на malformed-ответе нет. 104/104, clippy 0.
 - **N5:** лимит файла 512 МБ перед чтением в память в file_worker (UI).
+
+
+## 2026-11-17 (аудит-фикс S3)
+- `app-rust`: сид в AppState и воркерах теперь `zeroize::Zeroizing<Vec<u8>>` (стирается при drop); hex-строка используется только для отображения и не материализует сид обратно. aarch64 .so 17 354 296 Б, 31 JNI.

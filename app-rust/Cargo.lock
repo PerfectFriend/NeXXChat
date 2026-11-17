@@ -1675,6 +1675,7 @@ dependencies = [
  "wgpu",
  "winit",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

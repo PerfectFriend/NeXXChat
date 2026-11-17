@@ -64,7 +64,7 @@ fn link_worker(
     host: String,
     port: u16,
     ca_pem: &'static str,
-    seed: Vec<u8>,
+    seed: zeroize::Zeroizing<Vec<u8>>,
     ev: Sender<LinkEvent>,
     cmd: Receiver<LinkCmd>,
 ) {
@@ -221,7 +221,7 @@ fn chat_worker(
     host: String,
     port: u16,
     ca_pem: &'static str,
-    seed: Vec<u8>,
+    seed: zeroize::Zeroizing<Vec<u8>>,
     ev: Sender<ChatEvent>,
     cmd: Receiver<WorkerCmd>,
 ) {
@@ -422,8 +422,8 @@ pub struct NeXXUi {
     chat_input: String,
     chat_tx: Option<Sender<WorkerCmd>>,
     chat_rx: Option<Receiver<ChatEvent>>,
-    // контакты (Этап 2.2)
-    seed: Vec<u8>,
+    // контакты (Этап 2.2). S3: сид только в Zeroizing, не строкой.
+    seed: zeroize::Zeroizing<Vec<u8>>,
     contacts: Vec<nexxrust::protocols::contact_store::ContactRecord>,
     invite_input: String,
     contact_name: String,
@@ -503,7 +503,7 @@ impl NeXXUi {
             chat_input: String::new(),
             chat_tx: None,
             chat_rx: None,
-            seed: vec![],
+            seed: zeroize::Zeroizing::new(vec![]),
             contacts: vec![],
             invite_input: String::new(),
             contact_name: String::new(),
@@ -594,7 +594,7 @@ impl NeXXUi {
                     if bip39::validate_mnemonic(&self.mnemonic) {
                         let seed = bip39::seed_from_mnemonic_standard(&m, "");
                         self.seed_hex = crypto::hex_encode(&seed);
-                        self.seed = seed.clone();
+                        self.seed = zeroize::Zeroizing::new(seed.clone());
                         self.load_contacts();
                         self.fleet = keytree::plan_fleet(&seed, 5);
                         self.node_status = vec![String::new(); self.fleet.len()];
@@ -1452,7 +1452,7 @@ impl NeXXUi {
                             self.chat_status = format!("неизвестный релей {}:{}", self.chat_host, self.chat_port);
                             return;
                         };
-                        let seed = crypto::hex_decode(&self.seed_hex).unwrap_or_default();
+                        let seed = self.seed.clone();
                         let (ev_tx, ev_rx) = channel::<ChatEvent>();
                         let (cmd_tx, cmd_rx) = channel::<WorkerCmd>();
                         self.chat_rx = Some(ev_rx);
@@ -1460,7 +1460,7 @@ impl NeXXUi {
                         self.chat_status = "connecting…".into();
                         let host = self.chat_host.clone();
                         let port = self.chat_port;
-                        std::thread::spawn(move || chat_worker(host, port, ca_pem, seed, ev_tx, cmd_rx));
+                        std::thread::spawn(move || chat_worker(host, port, ca_pem, seed.clone(), ev_tx, cmd_rx));
                     }
                 } else {
                     ui.label(format!("Мой адрес: {}…", &self.chat_rcv[..self.chat_rcv.len().min(16)]));
@@ -1483,7 +1483,7 @@ impl NeXXUi {
                         if !self.route_allowed() {
                             self.link_status = "🚫 kill-switch: без прокси линк не поднимается".into();
                         } else if let Some(ca_pem) = crate::servers::ca_for(&self.chat_host, self.chat_port) {
-                            let seed = crypto::hex_decode(&self.seed_hex).unwrap_or_default();
+                            let seed = self.seed.clone();
                             let (ev_tx, ev_rx) = channel::<LinkEvent>();
                             let (cmd_tx, cmd_rx) = channel::<LinkCmd>();
                             self.link_rx = Some(ev_rx);
@@ -1491,7 +1491,7 @@ impl NeXXUi {
                             self.link_status = "link: NEW+SUB…".into();
                             let host = self.chat_host.clone();
                             let port = self.chat_port;
-                            std::thread::spawn(move || link_worker(host, port, ca_pem, seed, ev_tx, cmd_rx));
+                            std::thread::spawn(move || link_worker(host, port, ca_pem, seed.clone(), ev_tx, cmd_rx));
                         } else {
                             self.link_status = "неизвестный релей для линка".into();
                         }
@@ -1755,7 +1755,7 @@ impl NeXXUi {
 
     fn wallet(&self, ui: &mut egui::Ui) {
         ui.heading("Универсальный кошелёк");
-        let seed = crypto::hex_decode(&self.seed_hex).unwrap_or_default();
+        let seed = self.seed.clone();
         for (chain, path, addr) in [
             ("ETH", "m/44'/60'/0'/0/0", keytree::derive_path_secp256k1(&seed, "m/44'/60'/0'/0/0").and_then(|k| keytree::eth_address(&k.private))),
             ("BTC", "m/84'/0'/0'/0/0", keytree::derive_path_secp256k1(&seed, "m/84'/0'/0'/0/0").and_then(|k| keytree::btc_bech32_address(&k.private))),
