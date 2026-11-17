@@ -13,7 +13,7 @@ BIN=${CARGO_TARGET_DIR:-/home/thomas/build/cache/cargo-target}/release
 export NEXX_TLS=openssl
 
 echo "== build =="
-cargo build --release --bin chat_flow --bin agent_smoke --bin agent_rotate --bin smp_cmds --bin invite_flow --bin xftp_chunk --bin xftp_smoke || exit 1
+cargo build --release --bin chat_flow --bin agent_smoke --bin agent_rotate --bin smp_cmds --bin invite_flow --bin xftp_chunk --bin xftp_smoke --bin contact_link_smoke --bin xftp_file_smoke --bin xftp_big_smoke --bin agent_rotate_lib_smoke --bin group_smoke || exit 1
 
 run() {
   local name=$1; shift
@@ -30,7 +30,14 @@ run invite_flow "$HOST" | grep -q "INVITE FLOW OK" && echo "PASS invite_flow" ||
 XFTP_HOST=${XFTP_HOST:-xftp1.simplex.im:443}
 XFTP_H=${XFTP_HOST%%:*}; XFTP_P=${XFTP_HOST##*:}
 run xftp_smoke "$XFTP_H" "$XFTP_P" | grep -q "XFTP INTEROP OK" && echo "PASS xftp_smoke" || echo "FAIL xftp_smoke"
-run xftp_chunk "$XFTP_H" "$XFTP_P" | grep -q "XFTP CHUNKED INTEROP OK" && echo "PASS xftp_chunk" || echo "FAIL xftp_chunk"
+run xftp_chunk | grep -q "XFTP CHUNKED INTEROP OK" && echo "PASS xftp_chunk" || echo "FAIL xftp_chunk"
+run contact_link_smoke "${HOST%%:*}:5223" | grep -q "CONTACT LINK SMOKE OK" && echo "PASS contact_link_smoke" || echo "FAIL contact_link_smoke"
+run xftp_file_smoke "$XFTP_H" "$XFTP_P" | grep -q "XFTP FILE SMOKE OK" && echo "PASS xftp_file_smoke" || echo "FAIL xftp_file_smoke"
+echo "== xftp_big_smoke =="
+timeout 420 "$BIN/xftp_big_smoke" "$XFTP_H" "$XFTP_P" 2>&1 | grep -aE "OK|FAIL|panic" | tail -4 | tee /tmp/nexx_big_smoke.out
+grep -q "XFTP BIG" /tmp/nexx_big_smoke.out && echo "PASS xftp_big_smoke" || echo "FAIL xftp_big_smoke"
+run agent_rotate_lib_smoke "${HOST%%:*}:5223" | grep -q "ROTATE LIB SMOKE OK" && echo "PASS agent_rotate_lib_smoke" || echo "FAIL agent_rotate_lib_smoke"
+run group_smoke "${HOST%%:*}:5223" | grep -q "GROUP" && echo "PASS group_smoke" || echo "FAIL group_smoke"
 
 echo "== unit tests =="
 cargo test --release --lib 2>&1 | grep -E "test result: ok" && echo "PASS unit" || echo "FAIL unit"

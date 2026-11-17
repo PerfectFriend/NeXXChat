@@ -1377,7 +1377,17 @@ impl NeXXUi {
                     LinkEvent::PeerReady(p) => {
                         self.link_ready = true;
                         self.link_status = format!("🟢 peer установлен: {p}…");
-                        self.link_peer = p;
+                        self.link_peer = p.clone();
+                        // подгружаем сохранённую историю этого peer из шифрованного стора
+                        if self.link_msgs.is_empty() && !self.seed.is_empty() {
+                            let mp = std::path::PathBuf::from(format!("{}/messages.bin", data_dir()));
+                            if let Ok(ms) = nexxrust::protocols::message_store::MessageStore::open(&mp, &self.seed) {
+                                self.link_msgs = ms.history(&p).into_iter().rev().map(|m| ChatMsg {
+                                    outgoing: m.outgoing,
+                                    body: m.body.clone(),
+                                }).collect();
+                            }
+                        }
                     }
                     LinkEvent::Incoming(b) => {
                         self.link_msgs.push(ChatMsg { outgoing: false, body: b.clone() });
