@@ -20,6 +20,8 @@ pub struct ProxyRuntime {
     pub allow: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
     pub port: Arc<std::sync::Mutex<Option<u16>>>,
+    /// Upstream SOCKS5 (напр. Xray-ядро libv2ray на 127.0.0.1): если задан — весь CONNECT идёт через него.
+    pub upstream: Arc<std::sync::Mutex<Option<(String, u16)>>>,
 }
 
 impl ProxyRuntime {
@@ -28,7 +30,13 @@ impl ProxyRuntime {
             allow: Arc::new(AtomicBool::new(!kill_switch_on)),
             running: Arc::new(AtomicBool::new(false)),
             port: Arc::new(std::sync::Mutex::new(None)),
+            upstream: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Устанавливает upstream-SOCKS5 (host, port). None — прямой CONNECT.
+    pub fn set_upstream(&self, addr: Option<(String, u16)>) {
+        *self.upstream.lock().unwrap() = addr;
     }
 
     /// Запускает SOCKS5 на порту из диапазона [start,end] через port_alloc_acquire.
@@ -51,6 +59,7 @@ impl ProxyRuntime {
         *self.port.lock().unwrap() = Some(port);
         let allow = self.allow.clone();
         let running = self.running.clone();
+        let upstream = self.upstream.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 if !running.load(Ordering::SeqCst) {
@@ -59,8 +68,9 @@ impl ProxyRuntime {
                 match stream {
                     Ok(s) => {
                         let allow = allow.clone();
+                        let upstream = upstream.clone();
                         thread::spawn(move || {
-                            let _ = handle_socks5(s, allow);
+                            let _ = handle_socks5(s, allow, upstream);
                         });
                     }
                     Err(_) => break,
@@ -94,7 +104,7 @@ fn read_exact(s: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
 }
 
 /// Одно SOCKS5-соединение: handshake → CONNECT → pipe.
-fn handle_socks5(mut client: TcpStream, allow: Arc<AtomicBool>) -> std::io::Result<()> {
+fn handle_socks5(mut client: TcpStream, allow: Arc<AtomicBool>, upstream: Arc<std::sync::Mutex<Option<(String, u16)>>>) -> std::io::Result<()> {
     let _ = client.set_read_timeout(Some(Duration::from_secs(30)));
     // greeting: VER NMETHODS METHODS
     let mut head = [0u8; 2];
@@ -151,18 +161,66 @@ fn handle_socks5(mut client: TcpStream, allow: Arc<AtomicBool>) -> std::io::Resu
         return Ok(());
     }
 
-    let target = match TcpStream::connect((host.as_str(), port)) {
-        Ok(t) => t,
-        Err(_) => {
-            client.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?; // connection refused
-            return Ok(());
-        }
+    // если задан upstream (Xray/libv2ray) — CONNECT через него, иначе прямой
+    let up = upstream.lock().unwrap().clone();
+    let target = match up {
+        Some((uh, up_port)) => match socks5_connect_upstream(&uh, up_port, &host, port) {
+            Ok(t) => t,
+            Err(_) => {
+                client.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
+                return Ok(());
+            }
+        },
+        None => match TcpStream::connect((host.as_str(), port)) {
+            Ok(t) => t,
+            Err(_) => {
+                client.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
+                return Ok(());
+            }
+        },
     };
     // success reply: VER REP RSV ATYP BND.ADDR BND.PORT (0.0.0.0:0)
     client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
     let _ = client.set_read_timeout(None);
     let _ = target.set_read_timeout(None);
     pipe(client, target)
+}
+
+/// SOCKS5-клиент к upstream (Xray): handshake no-auth + CONNECT host:port.
+/// host может быть доменом (ATYP 0x03) или IPv4 (0x01).
+pub fn socks5_connect_upstream(up_host: &str, up_port: u16, host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let mut s = TcpStream::connect((up_host, up_port))?;
+    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    s.write_all(&[0x05, 0x01, 0x00])?;
+    let mut r = [0u8; 2];
+    s.read_exact(&mut r)?;
+    if r != [0x05, 0x00] {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "upstream auth required"));
+    }
+    let mut req = vec![0x05, 0x01, 0x00];
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        req.push(0x01);
+        req.extend_from_slice(&ip.octets());
+    } else {
+        req.push(0x03);
+        req.push(host.len().min(255) as u8);
+        req.extend_from_slice(&host.as_bytes()[..host.len().min(255)]);
+    }
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req)?;
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head)?;
+    if head[1] != 0x00 {
+        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, format!("upstream reply 0x{:02x}", head[1])));
+    }
+    match head[3] {
+        0x01 => { let mut b = [0u8; 6]; s.read_exact(&mut b)?; }
+        0x03 => { let mut l = [0u8; 1]; s.read_exact(&mut l)?; let mut b = vec![0u8; l[0] as usize + 2]; s.read_exact(&mut b)?; }
+        0x04 => { let mut b = [0u8; 18]; s.read_exact(&mut b)?; }
+        _ => {}
+    }
+    s.set_read_timeout(None)?;
+    Ok(s)
 }
 
 /// Bidirectional pipe между клиентом и целью до закрытия любой стороны.
@@ -279,5 +337,27 @@ mod tests {
         assert!(!rt.route_allowed(), "kill-switch on + прокси не поднят → block");
         rt.allow.store(true, Ordering::SeqCst);
         assert!(rt.route_allowed(), "прокси поднят → allow");
+    }
+
+    /// upstream-цепочка: клиент → наш SOCKS (upstream=Xray-порт) → echo. Данные идут через оба.
+    #[test]
+    fn upstream_chain_echo_roundtrip() {
+        let echo_port = echo_server();
+        // «Xray»: обычный SOCKS без upstream
+        let up = ProxyRuntime::new(false);
+        let up_port = up.start("/tmp/nexx_test_up.lock", 21500, 21599);
+        assert!(up_port > 0);
+        // основной прокси с upstream на «Xray»
+        let rt = ProxyRuntime::new(false);
+        rt.set_upstream(Some(("127.0.0.1".into(), up_port as u16)));
+        let p = rt.start("/tmp/nexx_test_main.lock", 21600, 21699);
+        assert!(p > 0);
+        let mut s = socks_connect(p as u16, "127.0.0.1", echo_port).expect("connect via chain");
+        s.write_all(b"via-upstream").unwrap();
+        let mut buf = [0u8; 12];
+        s.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"via-upstream");
+        rt.stop("/tmp/nexx_test_main.lock");
+        up.stop("/tmp/nexx_test_up.lock");
     }
 }

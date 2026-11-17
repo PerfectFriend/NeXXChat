@@ -431,6 +431,7 @@ pub struct NeXXUi {
     proxy_list: Vec<(String, String)>, // (remarks, json-конфиг)
     proxy_selected: usize,
     proxy_active: bool,
+    xray_port: Option<u16>,
     kill_switch: bool,
     proxy_status: String,
     runtime: nexxrust::proxy_runtime::ProxyRuntime,
@@ -508,6 +509,7 @@ impl NeXXUi {
             proxy_list: vec![],
             proxy_selected: 0,
             proxy_active: false,
+            xray_port: None,
             kill_switch: true, // по умолчанию kill-switch ВКЛЮЧЕН: без прокси — блок
             proxy_status: String::new(),
             runtime: nexxrust::proxy_runtime::ProxyRuntime::new(true),
@@ -1068,6 +1070,11 @@ impl NeXXUi {
                     self.proxy_status = "⏸ SOCKS5 остановлен, kill-switch снова блокирует прямой трафик".into();
                 } else {
                     let p = self.runtime.start(&lock, 21000, 21999);
+                    if p > 0 {
+                        if let Some(xp) = self.xray_port {
+                            self.runtime.set_upstream(Some(("127.0.0.1".into(), xp)));
+                        }
+                    }
                     self.proxy_status = if p > 0 {
                         self.proxy_active = true;
                         format!("✅ SOCKS5 поднят на 127.0.0.1:{p} — kill-switch пройден")
@@ -1100,6 +1107,9 @@ impl NeXXUi {
                 }
                 if ui.button("▶ Xray-ядро (libv2ray)").clicked() {
                     self.proxy_status = self.start_xray_core();
+                }
+                if self.xray_port.is_some() && ui.button("■ Стоп Xray").clicked() {
+                    self.proxy_status = self.stop_xray_core();
                 }
                 if ui.button(if self.proxy_active { "■ Выключить прокси" } else { "▶ Включить прокси" }).clicked() {
                     self.proxy_active = !self.proxy_active;
@@ -1194,10 +1204,21 @@ impl NeXXUi {
         match crate::v2ray_bridge::start(&assets, "nexx-android", &cfg) {
             Ok(()) => {
                 self.proxy_active = true;
-                format!("✅ Xray-ядро запущено: SOCKS5 127.0.0.1:{port} → {proto}")
+                self.xray_port = Some(port);
+                // если локальный SOCKS5 поднят — направляем его через Xray-ядро
+                self.runtime.set_upstream(Some(("127.0.0.1".into(), port)));
+                format!("✅ Xray-ядро запущено: SOCKS5 127.0.0.1:{port} → {proto}; локальный SOCKS5 направлен через него")
             }
             Err(e) => format!("❌ Xray start: {e}"),
         }
+    }
+
+    /// Остановка Xray-ядра и сброс upstream у локального SOCKS5.
+    fn stop_xray_core(&mut self) -> String {
+        crate::v2ray_bridge::stop();
+        self.xray_port = None;
+        self.runtime.set_upstream(None);
+        "⏸ Xray-ядро остановлено, локальный SOCKS5 снова прямой".into()
     }
 
     fn health_check_selected(&self) -> String {

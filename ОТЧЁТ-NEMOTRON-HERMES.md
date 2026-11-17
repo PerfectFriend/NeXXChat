@@ -292,3 +292,8 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 ## 2026-11-17 (продолжение 6): XFTP файлы >4MB + drag&drop
 - `bin/xftp_big_smoke.rs`: **XFTP BIG (8MB) SMOKE OK** vs xftp1.simplex.im:443 — 129 chunk'ей по 64KB, upload→link roundtrip→download (SHA-256 match)→FDEL. Лимита 4MB у релея нет.
 - UI 📎 Файлы: drag&drop файла в окно = сразу загрузка на XFTP.
+
+
+## 2026-11-17 (продолжение 7): Этап 4.3 — SOCKS5 через Xray/libv2ray
+- `rustcore/src/proxy_runtime.rs`: `ProxyRuntime.upstream` + `set_upstream()` + `socks5_connect_upstream()` (handshake no-auth, CONNECT domain/IPv4). Новый тест `upstream_chain_echo_roundtrip`: клиент→SOCKS→upstream-SOCKS→echo OK. **104/104**, clippy 0.
+- `app-rust`: при старте Xray-ядра локальный SOCKS5 автоматически направляется через него (upstream 127.0.0.1:xray); «■ Стоп Xray» сбрасывает upstream. aarch64 .so 17 299 928 Б, 31 JNI.
