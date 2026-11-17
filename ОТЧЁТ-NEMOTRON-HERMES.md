@@ -260,3 +260,13 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - `app-rust/src/ui.rs`: link_worker + секция «🔗 1-1 линк» в Chats (свой инвайт с копированием, приём инвайта, handshake, чат с peer); kill-switch блокирует линк без прокси.
 - Тесты rustcore **99/99**, clippy **0**. APK (3 ABI, libnexxapp+libgojni+geo assets) собран, в доставке в топик 23616.
 - Коммит `b0d761f` → PerfectFriend/NeXXChat master.
+
+
+## 2026-11-17 (продолжение 2): Этап 3.2 — файлы (XFTP) в библиотеке + UI
+- `rustcore/src/protocols/xftp_file.rs`: XftpConn (TLS1.3+ALPN xftp/1, h2, пиннинг keyHash CA в clientHello), `upload_file` (chunked 64KB, per-chunk ed25519 snd/rcv, XSalsa20-Poly1305 inner layer, nonce=fileNonce||be64(idx)), `download_file` (FGET per chunk, two-layer decrypt, whole-file SHA512 verify), `delete_file` (FDEL), `FileDesc::encode/decode` → link `nexx://file#/…`.
+- `bin/xftp_file_smoke.rs`: **XFTP FILE SMOKE OK** — 262080 B, 4 chunks, link roundtrip, SHA512 match, FDEL vs xftp1.simplex.im:443.
+- UI: Tab::Files «📎 Файлы» — upload по пути → link (📋 копия), download по link → `{data_dir}/downloads/`; file_worker на своём tokio runtime.
+- Cargo: tokio/h2/http/bytes переведены из host-only в общие зависимости (нужны под Android); futures остался host-only.
+- Тесты **101/101**, clippy **0**, XFTP FILE SMOKE OK после чистки варнингов.
+- Сборка: 3 ABI × 31 JNI (libnexxapp.so свежие закинуты в jniLibs вручную — build-android.sh кладёт только в target/), APK 157 514 992 Б → `~/apkexport/NeXX-allabi-debug.apk`, доставка в топик 23616 в фоне (slow mode ~15 мин).
+- Коммит `32461f1` → PerfectFriend/NeXXChat master.
