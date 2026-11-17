@@ -65,7 +65,7 @@ fn main() {
     let mut got: Option<String> = None;
     for _ in 0..60 {
         for cmd in client.take_pending() {
-            if let Some(t) = try_handle(&cmd, &mut client, srv2.as_bytes().try_into().unwrap(), &e2e2, &ids2.rcv_id, &auth1) {
+            if let Some(t) = try_handle(&cmd, &mut client, srv2.as_bytes(), &e2e2, &ids2.rcv_id, &auth1) {
                 got = Some(t);
                 break;
             }
@@ -74,7 +74,7 @@ fn main() {
         match client.recv_transmissions() {
             Ok(items) => {
                 for (_a, _c, _e, cmd) in items {
-                    if let Some(t) = try_handle(&cmd, &mut client, srv2.as_bytes().try_into().unwrap(), &e2e2, &ids2.rcv_id, &auth1) {
+                    if let Some(t) = try_handle(&cmd, &mut client, srv2.as_bytes(), &e2e2, &ids2.rcv_id, &auth1) {
                         got = Some(t);
                         break;
                     }
