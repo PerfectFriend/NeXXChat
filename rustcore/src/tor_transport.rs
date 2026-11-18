@@ -97,7 +97,7 @@ async fn socks_serve(listener: tokio::net::TcpListener, tor: Arc<arti_client::To
             let mut pb = [0u8; 2];
             if inbound.read_exact(&mut pb).await.is_err() { return; }
             let port = u16::from_be_bytes(pb);
-            enum Up { Tor(arti_client::DataStream), Tcp(tokio::net::TcpStream) }
+            enum Up { Tor(Box<arti_client::DataStream>), Tcp(tokio::net::TcpStream) }
             impl tokio::io::AsyncRead for Up {
                 fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
                     match &mut *self { Up::Tor(s) => std::pin::Pin::new(s).poll_read(cx, buf), Up::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf) }
@@ -116,7 +116,7 @@ async fn socks_serve(listener: tokio::net::TcpListener, tor: Arc<arti_client::To
             }
             let upstream: Up = if is_onion(&host) {
                 match tor.connect((host.as_str(), port)).await {
-                    Ok(s) => Up::Tor(s),
+                    Ok(s) => Up::Tor(Box::new(s)),
                     Err(_) => { let _ = inbound.write_all(&[0x05, 0x04, 0, 1, 0,0,0,0, 0,0]).await; return; }
                 }
             } else {
@@ -136,7 +136,7 @@ async fn socks_serve(listener: tokio::net::TcpListener, tor: Arc<arti_client::To
 /// Синхронный dial: .onion идёт через in-process Tor SOCKS, остальное — прямой TCP.
 pub fn dial(host: &str, port: u16, state_dir: &str) -> io::Result<TcpStream> {
     if is_onion(host) {
-        let sp = ensure_tor(state_dir).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let sp = ensure_tor(state_dir).map_err(io::Error::other)?;
         let s = TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], sp)),
             Duration::from_secs(15),
@@ -165,7 +165,7 @@ fn socks_connect(s: &TcpStream, host: &str, port: u16) -> io::Result<()> {
     s.write_all(&req)?;
     let mut h = [0u8; 4];
     s.read_exact(&mut h)?;
-    if h[1] != 0x00 { return Err(io::Error::new(io::ErrorKind::Other, format!("socks err {}", h[1]))); }
+    if h[1] != 0x00 { return Err(io::Error::other(format!("socks err {}", h[1]))); }
     let skip = match h[3] { 0x01 => 4, 0x03 => { let mut l = [0u8;1]; s.read_exact(&mut l)?; l[0] as usize }, 0x04 => 16, _ => 0 };
     let mut b = vec![0u8; skip + 2];
     s.read_exact(&mut b)?;
@@ -175,7 +175,7 @@ fn socks_connect(s: &TcpStream, host: &str, port: u16) -> io::Result<()> {
 /// Асинхронный dial для tokio-кода (xftp): .onion — через тот же SOCKS.
 pub async fn dial_async(host: &str, port: u16, state_dir: &str) -> io::Result<tokio::net::TcpStream> {
     if is_onion(host) {
-        let sp = ensure_tor(state_dir).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let sp = ensure_tor(state_dir).map_err(io::Error::other)?;
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", sp)).await?;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         s.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -188,7 +188,7 @@ pub async fn dial_async(host: &str, port: u16, state_dir: &str) -> io::Result<to
         s.write_all(&req).await?;
         let mut h = [0u8; 4];
         s.read_exact(&mut h).await?;
-        if h[1] != 0x00 { return Err(io::Error::new(io::ErrorKind::Other, format!("socks err {}", h[1]))); }
+        if h[1] != 0x00 { return Err(io::Error::other(format!("socks err {}", h[1]))); }
         let skip = match h[3] { 0x01 => 4, 0x03 => { let mut l = [0u8;1]; s.read_exact(&mut l).await?; l[0] as usize }, 0x04 => 16, _ => 0 };
         let mut b = vec![0u8; skip + 2];
         s.read_exact(&mut b).await?;

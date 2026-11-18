@@ -496,10 +496,6 @@ impl SmpClient {
         let conn =
             ClientConnection::new(Arc::new(config), sni).map_err(|e| format!("TLS init: {e}"))?;
         // Аудит M2: connect с таймаутом — иначе UI виснет на неотвечающем релее.
-        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-            .map_err(|e| format!("resolve {host}:{port}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("resolve {host}:{port}: нет адресов"))?;
         let sock = crate::tor_transport::dial(host, port, &crate::tor_transport::default_state_dir())
             .map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
         sock.set_read_timeout(Some(Duration::from_secs(60)))
@@ -599,10 +595,6 @@ impl SmpClient {
         };
 
         // Аудит M2: connect с таймаутом.
-        let raddr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-            .map_err(|e| format!("resolve {host}:{port}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("resolve {host}:{port}: нет адресов"))?;
         let sock = crate::tor_transport::dial(host, port, &crate::tor_transport::default_state_dir())
             .map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
         sock.set_read_timeout(Some(Duration::from_secs(60)))
