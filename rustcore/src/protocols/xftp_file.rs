@@ -234,7 +234,7 @@ impl XftpConn {
         builder.set_alpn_protos(b"\x06xftp/1").map_err(|e| e.to_string())?;
         builder.set_verify(openssl::ssl::SslVerifyMode::NONE); // пиннинг по keyHash в clientHello (ниже)
         let connector = builder.build();
-        let tcp = tokio::net::TcpStream::connect((host, port)).await.map_err(|e| format!("tcp: {e}"))?;
+        let tcp = crate::tor_transport::dial_async(host, port, &crate::tor_transport::default_state_dir()).await.map_err(|e| format!("tcp: {e}"))?;
         let mut ssl_obj = openssl::ssl::Ssl::new(connector.context()).map_err(|e| e.to_string())?;
         ssl_obj.set_alpn_protos(b"\x06xftp/1").map_err(|e| e.to_string())?;
         let mut ssl = tokio_openssl::SslStream::new(ssl_obj, tcp).map_err(|e| e.to_string())?;

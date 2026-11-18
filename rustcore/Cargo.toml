@@ -46,6 +46,9 @@ tokio-openssl = "0.6.5"
 openssl = "0.10"
 tokio-openssl = "0.6.5"
 futures = "0.3"
+# Встроенный Tor (in-process, без Orbot): .onion-транспорт для своих нод.
+arti-client = { version = "0.48", default-features = false, features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "0.48", features = ["tokio"] }
 
 [profile.release]
 opt-level = 2

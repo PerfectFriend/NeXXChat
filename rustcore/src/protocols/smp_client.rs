@@ -500,7 +500,7 @@ impl SmpClient {
             .map_err(|e| format!("resolve {host}:{port}: {e}"))?
             .next()
             .ok_or_else(|| format!("resolve {host}:{port}: нет адресов"))?;
-        let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(15))
+        let sock = crate::tor_transport::dial(host, port, &crate::tor_transport::default_state_dir())
             .map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
         sock.set_read_timeout(Some(Duration::from_secs(60)))
             .map_err(|e| format!("read timeout: {e}"))?;
@@ -603,7 +603,7 @@ impl SmpClient {
             .map_err(|e| format!("resolve {host}:{port}: {e}"))?
             .next()
             .ok_or_else(|| format!("resolve {host}:{port}: нет адресов"))?;
-        let sock = TcpStream::connect_timeout(&raddr, Duration::from_secs(15))
+        let sock = crate::tor_transport::dial(host, port, &crate::tor_transport::default_state_dir())
             .map_err(|e| format!("TCP connect {host}:{port}: {e}"))?;
         sock.set_read_timeout(Some(Duration::from_secs(60)))
             .map_err(|e| format!("read timeout: {e}"))?;
