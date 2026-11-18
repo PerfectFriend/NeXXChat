@@ -346,3 +346,7 @@ PING → NEW/IDS → SEND/OK → MSG (payload дешифрован и совпа
 - **N2:** idle-reaper в `jni_smp.rs` — сессии без обращений > 30 мин удаляются, ключи уходят из памяти (last_used + поток-раз в 5 мин). 104/104, clippy 0.
 - **N6:** threat model kill-switch задокументирован в шапке `proxy_runtime.rs`.
 - Все находки независимого аудита (K1, V1, S1-S5, N1-N6) закрыты или задокументированы.
+
+
+## 2026-11-17 (финал): полный interop 13/13 PASS
+`scripts/interop-all.sh` против живых релеев: PASS chat_flow, agent_smoke, agent_rotate, smp_cmds, invite_flow, xftp_smoke, xftp_chunk, contact_link_smoke, xftp_file_smoke, **xftp_big_smoke (8MB, с K1-пином)**, agent_rotate_lib_smoke, group_smoke, unit (104/104). Exit 0.
