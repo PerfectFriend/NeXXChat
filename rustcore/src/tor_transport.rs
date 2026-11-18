@@ -27,8 +27,8 @@ struct TorState {
     /// Пул изолированных Tor-клиентов: каждое новое SOCKS-соединение берёт
     /// следующий клиент round-robin → у каждого своя circuit-изоляция
     /// ("каждая сессия своим маршрутом" в тумане).
-    clients: Vec<Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>,
-    rr: std::sync::atomic::AtomicUsize,
+    /// Пул клиентов держим живым в TorState (drop = закрытие Tor-соединений).
+    _clients: Vec<Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>,
     _rt: tokio::runtime::Runtime,
 }
 
@@ -71,7 +71,7 @@ fn start_tor(state_dir: &str) -> Result<Arc<TorState>, String> {
         tokio::spawn(async move { socks_serve(listener, clients2).await });
         Ok::<(u16, Vec<Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>), String>((port, clients))
     })?;
-    Ok(Arc::new(TorState { socks_port: port, clients, rr: std::sync::atomic::AtomicUsize::new(0), _rt: rt }))
+    Ok(Arc::new(TorState { socks_port: port, _clients: clients, _rt: rt }))
 }
 
 /// SOCKS5 (no-auth) listener: CONNECT host:port → если .onion — через arti,
