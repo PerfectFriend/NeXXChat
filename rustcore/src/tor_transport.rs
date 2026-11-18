@@ -24,6 +24,11 @@ pub fn is_onion(host: &str) -> bool {
 
 struct TorState {
     socks_port: u16,
+    /// Пул изолированных Tor-клиентов: каждое новое SOCKS-соединение берёт
+    /// следующий клиент round-robin → у каждого своя circuit-изоляция
+    /// ("каждая сессия своим маршрутом" в тумане).
+    clients: Vec<Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>,
+    rr: std::sync::atomic::AtomicUsize,
     _rt: tokio::runtime::Runtime,
 }
 
@@ -42,7 +47,7 @@ fn start_tor(state_dir: &str) -> Result<Arc<TorState>, String> {
         .thread_name("nexx-arti")
         .build()
         .map_err(|e| format!("arti runtime: {e}"))?;
-    let port = rt.block_on(async move {
+    let (port, clients) = rt.block_on(async move {
         use arti_client::TorClient;
         let sd = format!("{state_dir}/state");
         let cd = format!("{state_dir}/cache");
@@ -52,25 +57,36 @@ fn start_tor(state_dir: &str) -> Result<Arc<TorState>, String> {
         let client = TorClient::create_bootstrapped(cfg)
             .await
             .map_err(|e| format!("tor bootstrap: {e}"))?;
-        // create_bootstrapped уже возвращает Arc<TorClient>
+        // create_bootstrapped уже возвращает Arc<TorClient>.
+        // N изолированных клиентов = N независимых наборов circuits.
+        const CIRCUIT_POOLS: usize = 3;
+        let mut clients = vec![client.clone()];
+        for _ in 1..CIRCUIT_POOLS {
+            clients.push(client.isolated_client());
+        }
         // Локальный SOCKS5: клиенты (sync и async dial) ходят на него.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| format!("socks bind: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-        tokio::spawn(async move { socks_serve(listener, client).await });
-        Ok::<u16, String>(port)
+        let clients2 = clients.clone();
+        tokio::spawn(async move { socks_serve(listener, clients2).await });
+        Ok::<(u16, Vec<Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>), String>((port, clients))
     })?;
-    Ok(Arc::new(TorState { socks_port: port, _rt: rt }))
+    Ok(Arc::new(TorState { socks_port: port, clients, rr: std::sync::atomic::AtomicUsize::new(0), _rt: rt }))
 }
 
 /// SOCKS5 (no-auth) listener: CONNECT host:port → если .onion — через arti,
 /// иначе прямой TCP. Обе стороны — boxed async streams, дальше copy_bidirectional.
-async fn socks_serve(listener: tokio::net::TcpListener, tor: Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>) {
+async fn socks_serve(listener: tokio::net::TcpListener, clients: Vec<Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>) {
+    let rr = std::sync::atomic::AtomicUsize::new(0);
     loop {
         let (mut inbound, _) = match listener.accept().await {
             Ok(x) => x,
             Err(_) => continue,
         };
-        let tor = tor.clone();
+        // multi-circuit: каждое новое соединение — следующий изолированный клиент
+        // (свои circuits), round-robin по пулу.
+        let idx = rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % clients.len();
+        let tor = clients[idx].clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             // handshake: VER NMETHODS METHODS...
