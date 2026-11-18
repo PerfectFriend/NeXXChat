@@ -67,6 +67,8 @@ struct Session {
     ids: crate::protocols::smp::QueueIds,
     /// Счётчик повреждённых сообщений (карантин, аудит H4).
     damaged: u64,
+    /// N2: unix-time последнего использования — для idle-reaper.
+    last_used: std::sync::atomic::AtomicU64,
 }
 
 /// Глобальный стор: только карта сессий. Мьютекс НЕ держится во время сети (H2).
@@ -86,7 +88,31 @@ fn with_session<R>(id: i64, f: impl FnOnce(&mut Session) -> R) -> Result<R, Stri
         map.get(&id).cloned().ok_or("session not found")?
     };
     let mut guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+    guard.last_used.store(now_unix(), std::sync::atomic::Ordering::Relaxed);
     Ok(f(&mut guard))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// N2: idle-reaper — сессии без обращений > 30 мин удаляются (ключи уходят из памяти).
+/// Запускается один раз при первом smpConnect.
+fn spawn_idle_reaper() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(300));
+            let cutoff = now_unix().saturating_sub(1800);
+            let mut map = lock_sessions();
+            let stale: Vec<i64> = map.iter()
+                .filter(|(_, s)| s.lock().map(|g| g.last_used.load(std::sync::atomic::Ordering::Relaxed) < cutoff).unwrap_or(true))
+                .map(|(k, _)| *k)
+                .collect();
+            for k in stale { map.remove(&k); }
+        });
+    });
 }
 
 /// String smpConnect(String host, int port, String caPem, String keyHashHex,
@@ -107,6 +133,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpConnect(
     auth_sk_hex: JString,
     dh_sk_hex: JString,
 ) -> jstring {
+    spawn_idle_reaper();
     let host = get_str(&mut env, host);
     let ca = get_str(&mut env, ca_pem);
     let key_hash_hex = get_str(&mut env, key_hash_hex);
@@ -172,6 +199,7 @@ pub extern "system" fn Java_com_nexx_rustcore_RustCore_smpConnect(
                     sender_can_secure: false,
                 },
                 damaged: 0,
+        last_used: std::sync::atomic::AtomicU64::new(now_unix()),
             };
             lock_sessions().insert(id, Arc::new(Mutex::new(session)));
             Ok(format!("{{\"ok\":true,\"session\":{id},\"version\":{version}}}"))
