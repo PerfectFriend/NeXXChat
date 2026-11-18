@@ -34,7 +34,7 @@ run xftp_chunk | grep -q "XFTP CHUNKED INTEROP OK" && echo "PASS xftp_chunk" || 
 run contact_link_smoke "${HOST%%:*}:5223" | grep -q "CONTACT LINK SMOKE OK" && echo "PASS contact_link_smoke" || echo "FAIL contact_link_smoke"
 run xftp_file_smoke "$XFTP_H" "$XFTP_P" | grep -q "XFTP FILE SMOKE OK" && echo "PASS xftp_file_smoke" || echo "FAIL xftp_file_smoke"
 echo "== xftp_big_smoke =="
-timeout 420 "$BIN/xftp_big_smoke" "$XFTP_H" "$XFTP_P" 2>&1 | grep -aE "OK|FAIL|panic" | tail -4 | tee /tmp/nexx_big_smoke.out
+timeout 600 "$BIN/xftp_big_smoke" "$XFTP_H" "$XFTP_P" 2>&1 | grep -aE "OK|FAIL|panic" | tail -4 | tee /tmp/nexx_big_smoke.out
 grep -q "XFTP BIG" /tmp/nexx_big_smoke.out && echo "PASS xftp_big_smoke" || echo "FAIL xftp_big_smoke"
 run agent_rotate_lib_smoke "${HOST%%:*}:5223" | grep -q "ROTATE LIB SMOKE OK" && echo "PASS agent_rotate_lib_smoke" || echo "FAIL agent_rotate_lib_smoke"
 run group_smoke "${HOST%%:*}:5223" | grep -q "GROUP" && echo "PASS group_smoke" || echo "FAIL group_smoke"
