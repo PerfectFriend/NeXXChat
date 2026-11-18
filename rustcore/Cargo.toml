@@ -37,6 +37,9 @@ http = "1"
 bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 webpki-roots = "0.26"
+# Встроенный Tor (in-process, без Orbot): .onion-транспорт для своих нод — нужен и на Android.
+arti-client = { version = "0.48", default-features = false, features = ["tokio", "rustls", "static-sqlite"] }
+tor-rtcompat = { version = "0.48", features = ["tokio"] }
 # Android: собираем OpenSSL из исходников (vendored) — в NDK готовой libssl нет.
 [target.'cfg(target_os = "android")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
@@ -46,9 +49,6 @@ tokio-openssl = "0.6.5"
 openssl = "0.10"
 tokio-openssl = "0.6.5"
 futures = "0.3"
-# Встроенный Tor (in-process, без Orbot): .onion-транспорт для своих нод.
-arti-client = { version = "0.48", default-features = false, features = ["tokio", "rustls"] }
-tor-rtcompat = { version = "0.48", features = ["tokio"] }
 
 [profile.release]
 opt-level = 2

@@ -220,7 +220,7 @@ struct ChatMsg {
 fn chat_worker(
     host: String,
     port: u16,
-    ca_pem: &'static str,
+    ca_pem: String,
     seed: zeroize::Zeroizing<Vec<u8>>,
     ev: Sender<ChatEvent>,
     cmd: Receiver<WorkerCmd>,
@@ -232,7 +232,7 @@ fn chat_worker(
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
     'reconnect: loop {
         say(ChatEvent::Status("TLS connect…".into()));
-        let mut client = match SmpClient::connect_openssl_with_ca(&host, port, Some(ca_pem)) {
+        let mut client = match SmpClient::connect_openssl_with_ca(&host, port, Some(&ca_pem)) {
             Ok(c) => {
                 backoff = Duration::from_secs(1); // успех — сброс backoff
                 c
@@ -415,6 +415,11 @@ pub struct NeXXUi {
     // чат
     chat_host: String,
     chat_port: u16,
+    // Свой релей (своя нода в онионе): host:port + CA PEM; keyHash пинится из CA автоматически.
+    use_custom_relay: bool,
+    custom_host: String,
+    custom_port: u16,
+    custom_ca_pem: String,
     chat_status: String,
     chat_ready: bool,
     chat_rcv: String,
@@ -496,6 +501,10 @@ impl NeXXUi {
             node_host: vec![],
             chat_host: "smp6.simplex.im".into(),
             chat_port: 5223,
+            use_custom_relay: false,
+            custom_host: String::new(),
+            custom_port: 5223,
+            custom_ca_pem: String::new(),
             chat_status: String::new(),
             chat_ready: false,
             chat_rcv: String::new(),
@@ -1427,16 +1436,38 @@ impl NeXXUi {
                         .iter()
                         .position(|s| s.host == self.chat_host && s.port == self.chat_port)
                         .unwrap_or(0);
+                    let names: Vec<&str> = crate::servers::SERVERS.iter().map(|s| s.name)
+                        .chain(std::iter::once("Свой релей (.onion / IP)…")).collect();
+                    let mut selected = if self.use_custom_relay { names.len() - 1 } else {
+                        crate::servers::SERVERS.iter().position(|s| s.host == self.chat_host && s.port == self.chat_port).unwrap_or(0)
+                    };
                     egui::ComboBox::from_id_salt("server_pick")
-                        .selected_text(crate::servers::SERVERS[selected].name)
+                        .selected_text(names[selected])
                         .show_ui(ui, |ui| {
-                            for (i, s) in crate::servers::SERVERS.iter().enumerate() {
-                                ui.selectable_value(&mut selected, i, s.name);
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(&mut selected, i, *n);
                             }
                         });
-                    let srv = &crate::servers::SERVERS[selected];
-                    self.chat_host = srv.host.to_string();
-                    self.chat_port = srv.port;
+                    self.use_custom_relay = selected == names.len() - 1;
+                    if !self.use_custom_relay {
+                        let srv = &crate::servers::SERVERS[selected];
+                        self.chat_host = srv.host.to_string();
+                        self.chat_port = srv.port;
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Хост:");
+                            ui.text_edit_singleline(&mut self.custom_host);
+                            ui.label("Порт:");
+                            let mut p = self.custom_port.to_string();
+                            if ui.text_edit_singleline(&mut p).changed() {
+                                self.custom_port = p.trim().parse().unwrap_or(5223);
+                            }
+                        });
+                        ui.label("CA PEM (корневой CA релея — пиннинг по нему):");
+                        ui.add(egui::TextEdit::multiline(&mut self.custom_ca_pem).desired_rows(4).desired_width(420.0));
+                        self.chat_host = self.custom_host.trim().to_string();
+                        self.chat_port = self.custom_port;
+                    }
                     ui.horizontal(|ui| {
                         ui.label(format!("{}:{}", self.chat_host, self.chat_port));
                     });
@@ -1448,9 +1479,20 @@ impl NeXXUi {
                             return;
                         }
                         // M6: CA только из конфига; неизвестный хост — отказ, не чужой CA.
-                        let Some(ca_pem) = crate::servers::ca_for(&self.chat_host, self.chat_port) else {
-                            self.chat_status = format!("неизвестный релей {}:{}", self.chat_host, self.chat_port);
-                            return;
+                        let ca_pem: String = if self.use_custom_relay {
+                            if self.custom_ca_pem.trim().is_empty() {
+                                self.chat_status = "для своего релея обязателен CA PEM (keyHash пинится из него)".into();
+                                return;
+                            }
+                            self.custom_ca_pem.clone()
+                        } else {
+                            match crate::servers::ca_for(&self.chat_host, self.chat_port) {
+                                Some(ca) => ca.to_string(),
+                                None => {
+                                    self.chat_status = format!("неизвестный релей {}:{}", self.chat_host, self.chat_port);
+                                    return;
+                                }
+                            }
                         };
                         let seed = self.seed.clone();
                         let (ev_tx, ev_rx) = channel::<ChatEvent>();
