@@ -217,10 +217,11 @@ struct ChatMsg {
     body: String,
 }
 
+/// relays: (host, port, ca_pem) — одна очередь создаётся на КАЖДОМ релее с одними
+/// ключами (fan-out «тумана»): send дублируется на все, poll опрашивает все,
+/// дедуп входящих по msg_id. .onion-релеи ходят через встроенный arti-Tor.
 fn chat_worker(
-    host: String,
-    port: u16,
-    ca_pem: String,
+    relays: Vec<(String, u16, String)>,
     seed: zeroize::Zeroizing<Vec<u8>>,
     ev: Sender<ChatEvent>,
     cmd: Receiver<WorkerCmd>,
@@ -232,24 +233,25 @@ fn chat_worker(
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
     'reconnect: loop {
         say(ChatEvent::Status("TLS connect…".into()));
-        let mut client = match SmpClient::connect_openssl_with_ca(&host, port, Some(&ca_pem)) {
-            Ok(c) => {
-                backoff = Duration::from_secs(1); // успех — сброс backoff
-                c
+        let mut clients: Vec<(String, u16, SmpClient)> = Vec::new();
+        for (host, port, ca_pem) in &relays {
+            match SmpClient::connect_openssl_with_ca(host, *port, Some(ca_pem)) {
+                Ok(c) => clients.push((host.clone(), *port, c)),
+                Err(e) => say(ChatEvent::Err(format!("connect {host}:{port}: {e}"))),
             }
-            Err(e) => {
-                say(ChatEvent::Err(format!("connect: {e} — retry in {:?}", backoff)));
-                // Quit во время backoff — выходим сразу
-                if let Ok(WorkerCmd::Quit) = cmd.try_recv() {
-                    return;
-                }
-                std::thread::sleep(backoff);
-                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
-                continue 'reconnect;
-            }
-        };
+        }
+        if clients.is_empty() {
+            if let Ok(WorkerCmd::Quit) = cmd.try_recv() { return; }
+            say(ChatEvent::Err(format!("нет ни одного релея — retry in {:?}", backoff)));
+            std::thread::sleep(backoff);
+            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+            continue 'reconnect;
+        }
+        backoff = Duration::from_secs(1);
         // Неблокирующий poll: иначе recv_transmissions ждёт до 60 с и команды Send из UI встают в очередь.
-        client.set_read_timeout(Some(Duration::from_millis(400)));
+        for (_h, _p, client) in &mut clients {
+            client.set_read_timeout(Some(Duration::from_millis(400)));
+        }
         // Аудит H5: у каждой очереди — свой индекс и свои ключи (раньше все очереди
         // использовали m/0'/0'/0' и m/0'/0'/1' — одна идентичность на все серверы).
         // Реквизиты очереди сохраняются в зашифрованное хранилище, чтобы после
@@ -264,6 +266,7 @@ fn chat_worker(
                 continue 'reconnect;
             }
         };
+        let (host, port, _) = relays[0].clone();
         let label = format!("self@{host}:{port}");
         let index = store.find_by_label(&label).map(|r| r.index).unwrap_or_else(|| store.next_index());
         let keys = match queue_store::derive_queue_keys(&seed, index) {
@@ -277,11 +280,19 @@ fn chat_worker(
         };
         let auth = keys.auth;
         let dh = keys.dh;
-        say(ChatEvent::Status("NEW queue…".into()));
-        let ids = match client.create_queue(&smp::RecipientKeys { auth_signing: auth.clone(), dh_secret: dh.clone() }) {
-            Ok(i) => i,
-            Err(e) => {
-                say(ChatEvent::Err(format!("NEW: {e} — retry in {:?}", backoff)));
+        say(ChatEvent::Status("NEW queue на всех релеях…".into()));
+        let mut ids = None;
+        for (_h, _p, client) in &mut clients {
+            match client.create_queue(&smp::RecipientKeys { auth_signing: auth.clone(), dh_secret: dh.clone() }) {
+                Ok(i) => { if ids.is_none() { ids = Some(i); } }
+                Err(e) => say(ChatEvent::Err(format!("NEW на {_h}:{_p}: {e}"))),
+            }
+        }
+        let ids = match ids {
+            Some(i) => i,
+            None => {
+                if let Ok(WorkerCmd::Quit) = cmd.try_recv() { return; }
+                say(ChatEvent::Err(format!("NEW: ни один релей не принял — retry in {:?}", backoff)));
                 std::thread::sleep(backoff);
                 backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
                 continue 'reconnect;
@@ -313,17 +324,24 @@ fn chat_worker(
             }
         };
         let srv = dh.diffie_hellman(&X25519Public::from(srv_pub));
-        // SUB — чтобы сервер пушил MSG без ручного GET
-        if let Err(e) = client.subscribe(&ids.rcv_id, &auth) {
-            say(ChatEvent::Err(format!("SUB: {e}")));
+        // SUB на всех релеях — чтобы сервер пушил MSG без ручного GET
+        for (_h, _p, client) in &mut clients {
+            if let Err(e) = client.subscribe(&ids.rcv_id, &auth) {
+                say(ChatEvent::Err(format!("SUB на {_h}:{_p}: {e}")));
+            }
         }
         say(ChatEvent::Ready(crypto::hex_encode(&ids.rcv_id)));
 
+        let mut seen_msg: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         loop {
-            // сначала pending (wait_response складывает входящие MSG туда)
-            let mut pending = client.take_pending();
+            // сначала pending всех релеев (wait_response складывает входящие MSG туда)
+            let mut pending: Vec<Vec<u8>> = Vec::new();
+            for (_h, _p, client) in &mut clients {
+                pending.extend(client.take_pending().drain(..));
+            }
             for c in pending.drain(..) {
                 if let Ok(m) = smp::parse_msg(&c) {
+                    if !seen_msg.insert(m.msg_id.clone()) { continue; } // дедуп fan-out
                     if let Ok(rcv) = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body) {
                         if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
                             if let Ok((_ph2, body)) = smp::parse_priv_header(&plain) {
@@ -331,7 +349,9 @@ fn chat_worker(
                             }
                         }
                     }
-                    let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
+                    for (_h, _p, client) in &mut clients {
+                        let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
+                    }
                 }
             }
             // команды из UI
@@ -341,27 +361,46 @@ fn chat_worker(
                         // ClientMessage = PrivHeader('_') + текст
                         let mut body = vec![b'_'];
                         body.extend_from_slice(text.as_bytes());
-                        match client.send_message(&ids.snd_id, e2e.as_bytes(), Some(&eph_pub_x509), &body, b"") {
-                            Ok(_) => say(ChatEvent::SentOk),
-                            Err(e) => say(ChatEvent::Err(format!("SEND: {e}"))),
+                        let mut ok = 0;
+                        for (_h, _p, client) in &mut clients {
+                            match client.send_message(&ids.snd_id, e2e.as_bytes(), Some(&eph_pub_x509), &body, b"") {
+                                Ok(_) => ok += 1,
+                                Err(e) => say(ChatEvent::Err(format!("SEND на {_h}:{_p}: {e}"))),
+                            }
                         }
+                        if ok > 0 { say(ChatEvent::SentOk); } else { say(ChatEvent::Err("SEND: все релеи отказали".into())); }
                     }
                     WorkerCmd::Quit => {
                         // Аудит H5: при закрытии удаляем очередь на сервере (DEL),
                         // чтобы на релее не оставались наши идентификаторы.
-                        if let Err(e) = client.delete_queue(&ids.rcv_id, &auth) {
-                            say(ChatEvent::Err(format!("DEL queue: {e}")));
+                        for (_h, _p, client) in &mut clients {
+                            if let Err(e) = client.delete_queue(&ids.rcv_id, &auth) {
+                                say(ChatEvent::Err(format!("DEL queue на {_h}:{_p}: {e}")));
+                            }
                         }
                         let _ = store.remove(&label);
                         return;
                     }
                 }
             }
-            // неблокирующий poll входящих
-            match client.recv_transmissions() {
-                Ok(items) => {
+            // неблокирующий poll всех релеев
+            let mut items_all: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+            for (_h, _p, client) in &mut clients {
+                match client.recv_transmissions() {
+                    Ok(items) => items_all.extend(items),
+                    Err(e) if e.contains("Resource temporarily unavailable") || e.contains("timed out") => {}
+                    Err(e) => say(ChatEvent::Err(format!("recv на {_h}:{_p}: {e}"))),
+                }
+            }
+            {
+                let items = items_all;
+                {
                     for (_a, _corr, _e, c) in items {
                         if let Ok(m) = smp::parse_msg(&c) {
+                            if !seen_msg.insert(m.msg_id.clone()) { 
+                                for (_h,_p,client) in &mut clients { let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id); }
+                                continue; 
+                            }
                             let rcv = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body);
                             if let Ok(rcv) = rcv {
                                 if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
@@ -370,30 +409,11 @@ fn chat_worker(
                                     }
                                 }
                             }
-                            let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
-                        }
-                    }
-                }
-                Err(e) if e.contains("Resource temporarily unavailable") || e.contains("timed out") => {}
-                Err(e) => {
-                    // Аудит M3: фатальная ошибка чтения — не выходим, а reconnect с backoff.
-                    say(ChatEvent::Err(format!("recv: {e} — reconnect in {:?}", backoff)));
-                    std::thread::sleep(backoff);
-                    backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
-                    continue 'reconnect;
-                }
-            }
-            let mut pending = client.take_pending();
-            for c in pending.drain(..) {
-                if let Ok(m) = smp::parse_msg(&c) {
-                    if let Ok(rcv) = smp::decrypt_rcv_msg(srv.as_bytes(), &m.msg_id, &m.body) {
-                        if let Ok((_ph, plain)) = smp::decrypt_client_msg(e2e.as_bytes(), &rcv.envelope) {
-                            if let Ok((_ph2, body)) = smp::parse_priv_header(&plain) {
-                                say(ChatEvent::Incoming(String::from_utf8_lossy(body).to_string()));
+                            for (_h, _p, client) in &mut clients {
+                                let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
                             }
                         }
                     }
-                    let _ = client.ack(&ids.rcv_id, &auth, &m.msg_id);
                 }
             }
             std::thread::sleep(Duration::from_millis(800));
@@ -1500,9 +1520,18 @@ impl NeXXUi {
                         self.chat_rx = Some(ev_rx);
                         self.chat_tx = Some(cmd_tx);
                         self.chat_status = "connecting…".into();
-                        let host = self.chat_host.clone();
-                        let port = self.chat_port;
-                        std::thread::spawn(move || chat_worker(host, port, ca_pem, seed.clone(), ev_tx, cmd_rx));
+                        let mut relays: Vec<(String, u16, String)> = vec![(self.chat_host.clone(), self.chat_port, ca_pem.clone())];
+                        // fan-out «тумана»: если введён второй релей (свой .onion) и он отличается — добавляем
+                        if self.use_custom_relay {
+                            let h = self.custom_host.trim().to_string();
+                            if !h.is_empty() && h != self.chat_host {
+                                relays.push((h, self.custom_port, self.custom_ca_pem.clone()));
+                            }
+                        } else if !self.custom_host.trim().is_empty() && self.custom_host.trim() != self.chat_host {
+                            // даже когда выбран публичный, свой .onion добавляется вторым релеем
+                            relays.push((self.custom_host.trim().to_string(), self.custom_port, self.custom_ca_pem.clone()));
+                        }
+                        std::thread::spawn(move || chat_worker(relays, seed.clone(), ev_tx, cmd_rx));
                     }
                 } else {
                     ui.label(format!("Мой адрес: {}…", &self.chat_rcv[..self.chat_rcv.len().min(16)]));
