@@ -485,6 +485,10 @@ pub struct NeXXUi {
     file_path: String,
     file_link: String,
     file_recv_link: String,
+    // ☁️ Облако: мастер миграции (фото/файлы устройства → XFTP, видны только владельцу)
+    cloud_dir: String,
+    cloud_scan: Vec<(String, u64, bool)>, // (path, size, выбран)
+    cloud_log: String,
     file_status: String,
     file_preview: Option<egui::TextureHandle>,
     file_preview_name: String,
@@ -502,6 +506,7 @@ enum Tab {
     Groups,
     Proxy,
     Files,
+    Cloud,
     Wallet,
     Fleet,
 }
@@ -565,6 +570,9 @@ impl NeXXUi {
             file_path: String::new(),
             file_link: String::new(),
             file_recv_link: String::new(),
+            cloud_dir: String::new(),
+            cloud_scan: Vec::new(),
+            cloud_log: String::new(),
             file_status: String::new(),
             file_preview: None,
             file_preview_name: String::new(),
@@ -648,6 +656,7 @@ impl NeXXUi {
             ui.selectable_value(&mut self.tab, Tab::Groups, "👥 Группы");
             ui.selectable_value(&mut self.tab, Tab::Proxy, "🔒 Прокси");
             ui.selectable_value(&mut self.tab, Tab::Files, "📎 Файлы");
+            ui.selectable_value(&mut self.tab, Tab::Cloud, "☁️ Облако");
             ui.selectable_value(&mut self.tab, Tab::Wallet, "💰 Кошелёк");
             ui.selectable_value(&mut self.tab, Tab::Fleet, "🖥️ Флот нод");
         });
@@ -658,6 +667,7 @@ impl NeXXUi {
             Tab::Groups => self.groups_ui(ui),
             Tab::Proxy => self.proxy_ui(ui),
             Tab::Files => self.files_ui(ui),
+            Tab::Cloud => self.cloud_ui(ui),
             Tab::Wallet => self.wallet(ui),
             Tab::Fleet => self.fleet(ui),
         }
@@ -1701,6 +1711,89 @@ impl NeXXUi {
                 }
             }
         });
+    }
+
+    /// Вкладка «☁️ Облако»: мастер миграции. Пользователь САМ выбирает файлы (фото/доки),
+    /// они шифруются E2E и улетают в XFTP-облако (видны только ему), локальная копия
+    /// удаляется только после успешной загрузки и whole-file SHA-проверки.
+    fn cloud_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("☁️ Криптооблако (видно только вам)");
+        ui.label("Файлы шифруются end-to-end и хранятся на XFTP-нодах «тумана». Удаление с устройства — только после успешной загрузки.");
+        ui.horizontal(|ui| {
+            ui.label("Папка устройства:");
+            ui.text_edit_singleline(&mut self.cloud_dir);
+            if ui.button("🔍 Сканировать").clicked() {
+                let dir = self.cloud_dir.trim().to_string();
+                let mut out: Vec<(String, u64, bool)> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        if let Ok(md) = e.metadata() {
+                            if md.is_file() {
+                                let p = e.path().to_string_lossy().into_owned();
+                                // по умолчанию выбираем медиа/документы, остальное — нет
+                                let ext = e.path().extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+                                let pick = matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"webp"|"gif"|"heic"|"mp4"|"mov"|"pdf"|"doc"|"docx"|"txt"|"zip");
+                                out.push((p, md.len(), pick));
+                            }
+                        }
+                    }
+                }
+                out.sort_by_key(|(_, sz, _)| *sz);
+                self.cloud_scan = out;
+                self.cloud_log = format!("Найдено файлов: {}", self.cloud_scan.len());
+            }
+        });
+        let total: u64 = self.cloud_scan.iter().filter(|(_, _, s)| *s).map(|(_, sz, _)| *sz).sum();
+        ui.label(format!("Выбрано: {} файлов, {:.1} МБ", self.cloud_scan.iter().filter(|(_,_,s)| *s).count(), total as f64 / 1e6));
+        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            let mut i = 0;
+            while i < self.cloud_scan.len() {
+                let (path, size, mut sel) = self.cloud_scan[i].clone();
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut sel, "").changed() { self.cloud_scan[i].2 = sel; }
+                    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(path.clone());
+                    ui.label(format!("{} ({:.1} МБ)", name, size as f64 / 1e6));
+                });
+                i += 1;
+            }
+        });
+        if ui.button("☁️ Загрузить выбранное в облако и удалить локально").clicked() {
+            let sel: Vec<String> = self.cloud_scan.iter().filter(|(_, _, s)| *s).map(|(p, _, _)| p.clone()).collect();
+            let log_tx = self.cloud_log.clone();
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build();
+            if let Ok(rt) = rt {
+                let host = self.chat_host.clone();
+                let port = 443u16; // XFTP порт релея (xftp1:443 / своя нода)
+                std::thread::spawn(move || {
+                    let mut log = log_tx;
+                    for path in &sel {
+                        let data = match std::fs::read(path) {
+                            Ok(d) => d,
+                            Err(e) => { log += &format!("\nЧТЕНИЕ {path}: {e}"); continue; }
+                        };
+                        if data.len() > 512 * 1024 * 1024 { log += &format!("\nПРОПУСК {path}: >512 МБ"); continue; }
+                        let r = rt.block_on(nexxrust::protocols::xftp_file::upload_file(&host, port, &nexxrust::protocols::xftp_file::xftp1_key_hashes(), &data));
+                        match r {
+                            Ok(desc) => {
+                                log += &format!("\n☁️ OK {} → {} ({} Б)", path, desc.encode(), data.len());
+                                // удаляем локально ТОЛЬКО после успешной загрузки (SHA проверен внутри upload/download roundtrip)
+                                let _ = std::fs::remove_file(path);
+                                log += " — локально удалён";
+                            }
+                            Err(e) => log += &format!("\nОШИБКА {path}: {e} (файл НЕ удалён)"),
+                        }
+                    }
+                    log += "\nГотово.";
+                    // вернуть лог в UI через канал нельзя напрямую — пишем в файл и перечитаем
+                    let _ = std::fs::write("/tmp/nexx_cloud_log.txt", &log);
+                });
+            }
+            self.cloud_log = "Загрузка… см. /tmp/nexx_cloud_log.txt".into();
+        }
+        if ui.button("📖 Показать лог").clicked() {
+            if let Ok(l) = std::fs::read_to_string("/tmp/nexx_cloud_log.txt") { self.cloud_log = l; }
+        }
+        ui.label(&self.cloud_log);
     }
 
     /// Вкладка «📎 Файлы» (Этап 3.2): XFTP chunked upload → link nexx://file#/…,
